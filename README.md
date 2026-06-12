@@ -149,15 +149,22 @@ Generated files such as `.build/`, `TokenBar.app/`, `.omc/`, `card-preview/`, an
 
 ## Security Notes
 
-Before publishing this repository, the source tree was scanned for common secret patterns such as API keys, OAuth tokens, private keys, bearer tokens, GitHub tokens, and provider credentials. No real secrets were found in the repository content.
+TokenBar is intended to run on your own Mac and reuse sessions you already control. It does not ask you to paste provider credentials into the source code.
 
-Keep these values out of Git:
+For normal use:
 
-- Provider API keys
-- OAuth access or refresh tokens
-- macOS Keychain exports
-- Local provider logs containing private prompts
-- Built app bundles or generated debug previews
+- Store OpenRouter keys with the in-app Keychain flow when possible.
+- Keep provider apps and CLIs logged in through their official login flows.
+- Treat local provider logs as private because they may include prompts, file paths, or project context.
+- Review network access expectations in the provider table before enabling a collector.
+
+For forks or local modifications, do not commit:
+
+- Provider API keys.
+- OAuth access or refresh tokens.
+- macOS Keychain exports.
+- Local AI tool logs containing private prompts or workspace context.
+- Built app bundles, generated previews, or debug output.
 
 ## License
 
@@ -314,15 +321,22 @@ swift run tokenbar
 
 ## 安全说明
 
-发布前已对仓库内容扫描常见敏感信息模式，包括 API Key、OAuth token、私钥、Bearer token、GitHub token 和各类服务凭据。当前仓库内容未发现真实敏感信息。
+TokenBar 的设计目标是在你自己的 Mac 上运行，并复用你已经掌控的本地登录状态。它不会要求你把服务商凭据写进源码。
 
-请不要把以下内容提交到 Git：
+日常使用时：
 
-- 服务商 API Key
-- OAuth access token 或 refresh token
-- macOS Keychain 导出
-- 可能包含私密 prompt 的本地服务日志
-- 构建产物、app bundle 或调试预览文件
+- OpenRouter API Key 建议通过应用菜单保存到 macOS Keychain。
+- 各服务 App 或 CLI 建议通过官方登录流程保持登录。
+- 本地 AI 工具日志可能包含 prompt、文件路径或项目上下文，请按私密数据处理。
+- 启用某个采集器前，可以先查看上方服务表格中的网络访问和数据来源说明。
+
+如果你 fork 或本地修改项目，请不要提交：
+
+- 服务商 API Key。
+- OAuth access token 或 refresh token。
+- macOS Keychain 导出。
+- 包含私密 prompt 或工作区上下文的本地 AI 工具日志。
+- 构建产物、app bundle、生成预览或调试输出。
 
 ## 许可证
 
