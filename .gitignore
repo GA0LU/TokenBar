@@ -1,0 +1,7 @@
+.build/
+.omc/
+TokenBar.app/
+card-preview/
+.claude/
+.DS_Store
+*.xcuserstate
