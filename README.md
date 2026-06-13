@@ -25,7 +25,7 @@ The app is designed for people who use multiple AI coding assistants and want a 
 |---|---|---|---|
 | Codex | 5-hour and weekly rate-limit windows | Local Codex app server via `/Applications/Codex.app/Contents/Resources/codex app-server` | Requires Codex.app to be installed and logged in. |
 | Claude | 5-hour and 7-day utilization | Claude Code OAuth credentials in macOS Keychain, with local-log fallback | `CLAUDE_OAUTH_CLIENT_ID` is required for OAuth refresh. |
-| Gemini | Daily and weekly request estimates | Local Gemini CLI logs under `~/.gemini/tmp` | Gemini Apps show short-window and weekly usage at `gemini.google.com/usage`; TokenBar currently estimates Gemini CLI usage locally because the CLI logs do not expose official server compute buckets. |
+| Gemini | 5-hour and weekly Gemini Apps usage | Authenticated Gemini web usage endpoint behind `gemini.google.com/usage` | Reuses local Chrome Google login cookies at runtime; cookies are not persisted by TokenBar. |
 | Cursor | Combined included usage plus API/auto-model breakdown | Cursor local `state.vscdb` session token and Cursor dashboard APIs | Requires Cursor to be installed and logged in. |
 | Antigravity | 5-hour and weekly quota buckets | Local Antigravity language server runtime API | Requires Antigravity to be running. |
 | OpenRouter | Total spend/credits usage | OpenRouter credits API | API key can be saved in Keychain from the TokenBar menu or provided via environment variable. |
@@ -197,7 +197,7 @@ TokenBar 是一个轻量级 Touch Bar 小组件和 macOS 菜单栏工具，用�
 |---|---|---|---|
 | Codex | 5 小时和每周限额窗口 | 本地 Codex app server：`/Applications/Codex.app/Contents/Resources/codex app-server` | 需要安装并登录 Codex.app。 |
 | Claude | 5 小时和 7 天用量 | macOS Keychain 中的 Claude Code OAuth 凭据，失败时使用本地日志估算 | OAuth 刷新需要 `CLAUDE_OAUTH_CLIENT_ID`。 |
-| Gemini | 每日和每周请求数估算 | `~/.gemini/tmp` 下的 Gemini CLI 本地日志 | Gemini Apps 会在 `gemini.google.com/usage` 显示短窗口和 weekly 用量；TokenBar 当前基于 Gemini CLI 本地日志估算，因为 CLI 日志不暴露官方服务端 compute bucket。 |
+| Gemini | Gemini Apps 5 小时和每周真实用量 | `gemini.google.com/usage` 背后的已认证 Gemini web usage endpoint | 运行时复用本机 Chrome 的 Google 登录 cookie；TokenBar 不会持久化这些 cookie。 |
 | Cursor | 总用量，以及 API/Auto 模型拆分 | Cursor 本地 `state.vscdb` 会话令牌和 Cursor 后台 API | 需要安装并登录 Cursor。 |
 | Antigravity | 5 小时和每周限额桶 | 本地 Antigravity language server 运行时 API | 需要 Antigravity 正在运行。 |
 | OpenRouter | 总消费/credits 用量 | OpenRouter credits API | API Key 可通过菜单保存到 Keychain，也可通过环境变量提供。 |

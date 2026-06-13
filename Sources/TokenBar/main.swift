@@ -1,4 +1,5 @@
 import AppKit
+import CommonCrypto
 import Foundation
 import QuartzCore
 import Security
@@ -51,7 +52,7 @@ enum Provider: String, CaseIterable, Codable, Sendable {
     var primaryWindowLabel: String {
         switch self {
         case .codex, .claude: "5h"
-        case .gemini: "Day"
+        case .gemini: "5h"
         case .cursor: "All"
         case .antigravity: "5h"
         case .openrouter: "Spent"
@@ -385,6 +386,238 @@ enum SecretStore {
     }
 }
 
+enum ChromeCookieStore {
+    struct GoogleSession {
+        let cookieHeader: String
+        let authorization: String?
+    }
+
+    private struct Cookie {
+        let host: String
+        let name: String
+        let value: String
+    }
+
+    private static let cookieNames = [
+        "SID", "HSID", "SSID", "APISID", "SAPISID",
+        "__Secure-1PSID", "__Secure-3PSID",
+        "__Secure-1PAPISID", "__Secure-3PAPISID",
+        "__Secure-1PSIDTS", "__Secure-3PSIDTS",
+        "__Secure-1PSIDCC", "__Secure-3PSIDCC",
+        "NID"
+    ]
+
+    static func googleCookieHeader() throws -> String {
+        try googleSession().cookieHeader
+    }
+
+    static func googleSession() throws -> GoogleSession {
+        guard let session = try googleSessions().first else {
+            throw CollectorError.message("Gemini Google login not found in Chrome")
+        }
+        return session
+    }
+
+    static func googleSessions() throws -> [GoogleSession] {
+        let key = try chromeSafeStorageKey()
+        let sessions = try chromeProfiles().compactMap { profile -> GoogleSession? in
+            var byName: [String: Cookie] = [:]
+            for cookie in try readCookies(from: profile.appendingPathComponent("Cookies"), key: key) {
+                byName[cookie.name] = cookie
+            }
+            guard byName["__Secure-1PSID"] != nil || byName["__Secure-3PSID"] != nil else {
+                return nil
+            }
+            let cookieHeader = cookieNames.compactMap { name in
+                byName[name].map { "\($0.name)=\($0.value)" }
+            }.joined(separator: "; ")
+            let sapisid = byName["SAPISID"]?.value
+                ?? byName["__Secure-1PAPISID"]?.value
+                ?? byName["__Secure-3PAPISID"]?.value
+            return GoogleSession(
+                cookieHeader: cookieHeader,
+                authorization: sapisid.map { sapisidHash(cookie: $0, origin: "https://gemini.google.com") }
+            )
+        }
+        guard !sessions.isEmpty else {
+            throw CollectorError.message("Gemini Google login not found in Chrome")
+        }
+        return sessions
+    }
+
+    private static func chromeProfiles() -> [URL] {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Google/Chrome", isDirectory: true)
+        guard let children = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        return children
+            .filter { FileManager.default.fileExists(atPath: $0.appendingPathComponent("Cookies").path) }
+            .sorted {
+                if $0.lastPathComponent == "Default" { return true }
+                if $1.lastPathComponent == "Default" { return false }
+                return $0.lastPathComponent < $1.lastPathComponent
+            }
+    }
+
+    private static func chromeSafeStorageKey() throws -> Data {
+        let secret = try runProcess(
+            "/usr/bin/security",
+            ["find-generic-password", "-s", "Chrome Safe Storage", "-w"]
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !secret.isEmpty else {
+            throw CollectorError.message("Chrome Safe Storage key not found")
+        }
+
+        let keyLength = kCCKeySizeAES128
+        var key = Data(count: keyLength)
+        let salt = Data("saltysalt".utf8)
+        let status = key.withUnsafeMutableBytes { keyBytes in
+            salt.withUnsafeBytes { saltBytes in
+                CCKeyDerivationPBKDF(
+                    CCPBKDFAlgorithm(kCCPBKDF2),
+                    secret,
+                    secret.utf8.count,
+                    saltBytes.bindMemory(to: UInt8.self).baseAddress,
+                    salt.count,
+                    CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1),
+                    1003,
+                    keyBytes.bindMemory(to: UInt8.self).baseAddress,
+                    keyLength
+                )
+            }
+        }
+        guard status == kCCSuccess else {
+            throw CollectorError.message("Chrome cookie key derivation failed")
+        }
+        return key
+    }
+
+    private static func readCookies(from database: URL, key: Data) throws -> [Cookie] {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tokenbar-chrome-cookies-\(UUID().uuidString).sqlite")
+        try FileManager.default.copyItem(at: database, to: temp)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let quotedNames = cookieNames.map { "'\($0)'" }.joined(separator: ",")
+        let sql = """
+        SELECT host_key, name, value, hex(encrypted_value)
+        FROM cookies
+        WHERE host_key IN ('.google.com', 'gemini.google.com')
+          AND name IN (\(quotedNames))
+        ORDER BY host_key, name;
+        """
+        let output = try runProcess("/usr/bin/sqlite3", ["-separator", "\t", temp.path, sql])
+        return output.split(separator: "\n").compactMap { line in
+            let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 4 else { return nil }
+            let host = parts[0]
+            let name = parts[1]
+            let plain = parts[2]
+            let encryptedHex = parts[3]
+            let value = plain.isEmpty ? decryptCookie(hex: encryptedHex, host: host, key: key) : plain
+            guard let value, !value.isEmpty else { return nil }
+            return Cookie(host: host, name: name, value: value)
+        }
+    }
+
+    private static func decryptCookie(hex: String, host: String, key: Data) -> String? {
+        guard var encrypted = Data(hexString: hex), !encrypted.isEmpty else { return nil }
+        if encrypted.starts(with: Data("v10".utf8)) || encrypted.starts(with: Data("v11".utf8)) {
+            encrypted.removeFirst(3)
+        }
+        let iv = Data(repeating: 0x20, count: kCCBlockSizeAES128)
+        let outputCapacity = encrypted.count + kCCBlockSizeAES128
+        var output = Data(count: outputCapacity)
+        var outputLength = 0
+        let status = output.withUnsafeMutableBytes { outputBytes in
+            encrypted.withUnsafeBytes { encryptedBytes in
+                key.withUnsafeBytes { keyBytes in
+                    iv.withUnsafeBytes { ivBytes in
+                        CCCrypt(
+                            CCOperation(kCCDecrypt),
+                            CCAlgorithm(kCCAlgorithmAES),
+                            CCOptions(kCCOptionPKCS7Padding),
+                            keyBytes.baseAddress,
+                            key.count,
+                            ivBytes.baseAddress,
+                            encryptedBytes.baseAddress,
+                            encrypted.count,
+                            outputBytes.baseAddress,
+                            outputCapacity,
+                            &outputLength
+                        )
+                    }
+                }
+            }
+        }
+        guard status == kCCSuccess else { return nil }
+        output.removeSubrange(outputLength..<output.count)
+
+        let hostDigest = sha256(Data(host.utf8))
+        if output.count > hostDigest.count && output.prefix(hostDigest.count) == hostDigest {
+            output.removeFirst(hostDigest.count)
+        }
+        return String(data: output, encoding: .utf8)
+    }
+
+    private static func sha256(_ data: Data) -> Data {
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes { bytes in
+            _ = CC_SHA256(bytes.baseAddress, CC_LONG(data.count), &digest)
+        }
+        return Data(digest)
+    }
+
+    private static func sapisidHash(cookie: String, origin: String) -> String {
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let input = "\(timestamp) \(cookie) \(origin)"
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        Data(input.utf8).withUnsafeBytes { bytes in
+            _ = CC_SHA1(bytes.baseAddress, CC_LONG(input.utf8.count), &digest)
+        }
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return "SAPISIDHASH \(timestamp)_\(hex)"
+    }
+
+    private static func runProcess(_ path: String, _ arguments: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw CollectorError.message(
+                "\(URL(fileURLWithPath: path).lastPathComponent) exited with \(process.terminationStatus)"
+            )
+        }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
+private extension Data {
+    init?(hexString: String) {
+        guard hexString.count.isMultiple(of: 2) else { return nil }
+        var data = Data()
+        var index = hexString.startIndex
+        while index < hexString.endIndex {
+            let next = hexString.index(index, offsetBy: 2)
+            guard let byte = UInt8(hexString[index..<next], radix: 16) else { return nil }
+            data.append(byte)
+            index = next
+        }
+        self = data
+    }
+}
+
 final class UsageStore: @unchecked Sendable {
     private let collectors: [UsageCollecting]
     private let queue = DispatchQueue(label: "TokenBar.UsageStore")
@@ -600,6 +833,7 @@ actor ClaudeUsageCollector: UsageCollecting {
 
     private var cached: UsageSnapshot?
     private var cachedAt = Date.distantPast
+
     private var nextFetchAt = Date.distantPast
     private var consecutiveFailures = 0
     private var restoredFromDisk = false
@@ -1060,109 +1294,313 @@ actor ClaudeUsageCollector: UsageCollecting {
     }
 }
 
-/// Estimates Gemini CLI quota usage by counting model responses in the local
-/// session logs. Gemini Apps now expose both short-window and weekly limits on
-/// gemini.google.com/usage, but the CLI logs available locally do not include
-/// Google's server-side compute buckets, so TokenBar presents local daily and
-/// weekly estimates until an authenticated usage endpoint is available here.
-struct GeminiUsageCollector: UsageCollecting {
+/// Reads Gemini Apps usage from the same authenticated web endpoint backing
+/// gemini.google.com/usage. The request reuses the user's local Chrome Google
+/// session cookies at runtime; TokenBar does not persist or log those cookies.
+actor GeminiUsageCollector: UsageCollecting {
     let provider: Provider = .gemini
-    // Gemini Code Assist / CLI daily request quota. Google AI Pro (this account's
-    // tier, confirmed via Antigravity's "Google AI Pro" userTier) grants 1500/day,
-    // shared between the CLI and IDE agent mode. (Free = 1000, Ultra = 2000.)
-    // Requests reset at midnight Pacific. The weekly value is a local 7-day
-    // estimate so the Touch Bar can mirror Gemini's weekly limit concept without
-    // scraping browser cookies or private web session state.
-    private static let dailyLimit = 1500.0
-    private static let weeklyLimit = dailyLimit * 7
 
-    private struct ChatLine: Decodable {
-        let type: String?
-        let timestamp: String?
+    private var cached: UsageSnapshot?
+    private var cachedAt = Date.distantPast
+
+    private struct Bootstrap {
+        let buildLabel: String?
+        let fSid: String?
+        let at: String?
+        let hl: String
     }
 
     func collect() async -> UsageSnapshot {
-        await Task.detached(priority: .utility) {
-            Self.snapshot()
-        }.value
+        let now = Date()
+        if let cached, now.timeIntervalSince(cachedAt) < 120 {
+            return cached
+        }
+        do {
+            let snapshot = try await fetchUsage()
+            cached = snapshot
+            cachedAt = now
+            return snapshot
+        } catch {
+            if let cached, now.timeIntervalSince(cachedAt) < 10 * 60 {
+                return cached
+            }
+            return .failure(.gemini, error.localizedDescription)
+        }
     }
 
-    private static func snapshot() -> UsageSnapshot {
-        let gemini = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini/tmp", isDirectory: true)
-        guard FileManager.default.fileExists(atPath: gemini.path) else {
-            return .failure(.gemini, "Gemini CLI not found")
+    private func fetchUsage() async throws -> UsageSnapshot {
+        var lastError: Error?
+        for session in try ChromeCookieStore.googleSessions() {
+            do {
+                let bootstrap = try await fetchBootstrap(session: session)
+                return try await fetchUsage(session: session, bootstrap: bootstrap)
+            } catch {
+                lastError = error
+                if !Self.isAuthenticationError(error) {
+                    throw error
+                }
+            }
+        }
+        throw lastError ?? CollectorError.message("Gemini login required in Chrome")
+    }
+
+    private static func isAuthenticationError(_ error: Error) -> Bool {
+        error.localizedDescription.contains("login required")
+            || error.localizedDescription.contains("HTTP 401")
+            || error.localizedDescription.contains("HTTP 403")
+    }
+
+    private func fetchBootstrap(session: ChromeCookieStore.GoogleSession) async throws -> Bootstrap {
+        var request = URLRequest(url: URL(string: "https://gemini.google.com/usage")!)
+        request.timeoutInterval = 12
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("https://gemini.google.com/usage", forHTTPHeaderField: "Referer")
+        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+        if let authorization = session.authorization {
+            request.setValue(authorization, forHTTPHeaderField: "Authorization")
+        }
+        request.setValue(session.cookieHeader, forHTTPHeaderField: "Cookie")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            throw CollectorError.message("Gemini usage page: HTTP \(status)")
+        }
+        guard let html = String(data: data, encoding: .utf8) else {
+            throw CollectorError.message("Gemini usage page: unreadable response")
+        }
+        return Bootstrap(
+            buildLabel: Self.firstMatch(#"boq_assistant-bard-web-server_[A-Za-z0-9._-]+"#, in: html),
+            fSid: Self.firstMatch(#""FdrFJe"\s*:\s*"(-?\d+)""#, in: html)
+                ?? Self.firstMatch(#"\[\s*"FdrFJe"\s*,\s*"(-?\d+)""#, in: html)
+                ?? Self.firstMatch(#"f\.sid=(-?\d+)"#, in: html),
+            at: Self.firstMatch(#""SNlM0e"\s*:\s*"([^"]+)""#, in: html)
+                ?? Self.firstMatch(#"\[\s*"SNlM0e"\s*,\s*"([^"]+)""#, in: html),
+            hl: Locale.current.language.languageCode?.identifier ?? "en"
+        )
+    }
+
+    private func fetchUsage(session: ChromeCookieStore.GoogleSession, bootstrap: Bootstrap) async throws -> UsageSnapshot {
+        var components = URLComponents(string: "https://gemini.google.com/_/BardChatUi/data/batchexecute")!
+        var queryItems = [
+            URLQueryItem(name: "rpcids", value: "jSf9Qc"),
+            URLQueryItem(name: "source-path", value: "/usage")
+        ]
+        if let buildLabel = bootstrap.buildLabel {
+            queryItems.append(URLQueryItem(name: "bl", value: buildLabel))
+        }
+        if let fSid = bootstrap.fSid {
+            queryItems.append(URLQueryItem(name: "f.sid", value: fSid))
+        }
+        queryItems.append(URLQueryItem(name: "hl", value: bootstrap.hl))
+        queryItems.append(URLQueryItem(name: "_reqid", value: String(Int.random(in: 100_000...999_999))))
+        queryItems.append(URLQueryItem(name: "rt", value: "c"))
+        components.queryItems = queryItems
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 12
+        request.setValue("application/x-www-form-urlencoded;charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+        request.setValue("https://gemini.google.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://gemini.google.com/usage", forHTTPHeaderField: "Referer")
+        request.setValue("1", forHTTPHeaderField: "X-Same-Domain")
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+        if let authorization = session.authorization {
+            request.setValue(authorization, forHTTPHeaderField: "Authorization")
+        }
+        request.setValue(session.cookieHeader, forHTTPHeaderField: "Cookie")
+        var fields = [
+            "f.req": #"[[["jSf9Qc","[]",null,"generic"]]]"#
+        ]
+        if let at = bootstrap.at, !at.isEmpty {
+            fields["at"] = at
+        }
+        request.httpBody = Self.formBody(fields)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            throw CollectorError.message("Gemini usage API: HTTP \(status)")
+        }
+        return try Self.parseUsageResponse(data)
+    }
+
+    private static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+
+    private static func firstMatch(_ pattern: String, in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range) else { return nil }
+        let captureIndex = match.numberOfRanges > 1 ? 1 : 0
+        guard let captureRange = Range(match.range(at: captureIndex), in: text) else { return nil }
+        return String(text[captureRange])
+            .replacingOccurrences(of: #"\/"#, with: "/")
+            .replacingOccurrences(of: #"\\u003d"#, with: "=")
+    }
+
+    private static func formBody(_ fields: [String: String]) -> Data {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._* ")
+        let body = fields.map { key, value in
+            let escapedKey = key.addingPercentEncoding(withAllowedCharacters: allowed)?
+                .replacingOccurrences(of: " ", with: "+") ?? key
+            let escapedValue = value.addingPercentEncoding(withAllowedCharacters: allowed)?
+                .replacingOccurrences(of: " ", with: "+") ?? value
+            return "\(escapedKey)=\(escapedValue)"
+        }.joined(separator: "&")
+        return Data(body.utf8)
+    }
+
+    private static func parseUsageResponse(_ data: Data) throws -> UsageSnapshot {
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw CollectorError.message("Gemini usage API: unreadable response")
+        }
+        let root = try batchedRows(from: text)
+        guard !root.isEmpty else {
+            throw CollectorError.message("Gemini usage API: bad response")
+        }
+        guard
+            let rpc = root.first(where: {
+                guard let row = $0 as? [Any], row.count > 2 else { return false }
+                return row[0] as? String == "wrb.fr" && row[1] as? String == "jSf9Qc"
+            }) as? [Any],
+            let payload = rpc[2] as? String,
+            !payload.isEmpty,
+            payload != "null"
+        else {
+            throw CollectorError.message("Gemini login required in Chrome")
+        }
+        guard let usageObject = try JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [Any] else {
+            throw CollectorError.message("Gemini usage API: bad payload")
         }
 
-        var pacific = Calendar(identifier: .gregorian)
-        pacific.timeZone = TimeZone(identifier: "America/Los_Angeles") ?? .current
-        let dayStart = pacific.startOfDay(for: Date())
-        let dayEnd = dayStart.addingTimeInterval(24 * 3600)
-        let weekStart = Date().addingTimeInterval(-7 * 24 * 3600)
-
-        let decoder = JSONDecoder()
-        var dailyRequests = 0
-        var weeklyRequests = 0
-        var oldestWeekly: Date?
-        var latest = Date.distantPast
-        if let enumerator = FileManager.default.enumerator(
-            at: gemini,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            for case let url as URL in enumerator {
-                // Gemini CLI stores chat logs both directly under a `chats`
-                // directory and nested in per-session subfolders, so match any
-                // `.jsonl` anywhere beneath a `chats` directory instead of only
-                // its immediate children (which dropped ~40% of requests).
-                guard url.pathExtension == "jsonl",
-                      url.pathComponents.contains("chats"),
-                      let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
-                      values.isRegularFile == true,
-                      (values.contentModificationDate ?? .distantPast) >= weekStart else {
-                    continue
-                }
-                guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
-                defer { try? handle.close() }
-                var reader = ClaudeUsageCollector.LineReader(handle)
-                while autoreleasepool(invoking: {
-                    guard let line = reader.next() else { return false }
-                    guard line.contains("\"type\":\"gemini\""),
-                          let data = line.data(using: .utf8),
-                          let parsed = try? decoder.decode(ChatLine.self, from: data),
-                          parsed.type == "gemini",
-                          let date = UsageFormat.parseDate(parsed.timestamp),
-                          date >= weekStart else {
-                        return true
-                    }
-                    weeklyRequests += 1
-                    if oldestWeekly == nil || date < oldestWeekly! {
-                        oldestWeekly = date
-                    }
-                    if date >= dayStart {
-                        dailyRequests += 1
-                    }
-                    latest = max(latest, date)
-                    return true
-                }) {}
-            }
+        var current: GeminiWindow?
+        var weekly: GeminiWindow?
+        collectWindows(in: usageObject, current: &current, weekly: &weekly)
+        guard current != nil || weekly != nil else {
+            throw CollectorError.message("Gemini usage API: no usage windows")
         }
 
         return UsageSnapshot(
             provider: .gemini,
-            primary: LimitWindow(
-                usedPercent: min(100, Double(dailyRequests) / dailyLimit * 100),
-                resetAt: dayEnd
-            ),
-            secondary: LimitWindow(
-                usedPercent: min(100, Double(weeklyRequests) / weeklyLimit * 100),
-                resetAt: oldestWeekly?.addingTimeInterval(7 * 24 * 3600)
-            ),
-            plan: "EST",
-            updatedAt: latest == .distantPast ? Date() : latest,
+            primary: current?.limitWindow,
+            secondary: weekly?.limitWindow,
+            plan: planName(from: usageObject),
+            updatedAt: Date(),
             error: nil
         )
     }
+
+    private static func batchedRows(from text: String) throws -> [Any] {
+        let lines = text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.hasPrefix(")]}'") }
+        let joined = lines.joined(separator: "\n")
+        if let root = try? JSONSerialization.jsonObject(with: Data(joined.utf8)) as? [Any] {
+            return root
+        }
+
+        var rows: [Any] = []
+        for line in lines where line.hasPrefix("[") {
+            guard let parsed = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [Any] else {
+                continue
+            }
+            if parsed.first is [Any] {
+                rows.append(contentsOf: parsed)
+            } else {
+                rows.append(parsed)
+            }
+        }
+        return rows
+    }
+
+    private struct GeminiWindow {
+        let usedPercent: Double
+        let resetAt: Date?
+
+        var limitWindow: LimitWindow {
+            LimitWindow(usedPercent: usedPercent, resetAt: resetAt)
+        }
+    }
+
+    private static func collectWindows(in value: Any, current: inout GeminiWindow?, weekly: inout GeminiWindow?) {
+        guard let array = value as? [Any] else { return }
+        if let type = int(array[safe: 2]),
+           (type == 1 || type == 2),
+           let fraction = number(array[safe: 1]) {
+            let window = GeminiWindow(
+                usedPercent: max(0, min(100, fraction * 100)),
+                resetAt: date(in: array[safe: 3] ?? array)
+            )
+            if type == 1 {
+                current = window
+            } else {
+                weekly = window
+            }
+        }
+        for child in array {
+            collectWindows(in: child, current: &current, weekly: &weekly)
+        }
+    }
+
+    private static func planName(from value: Any) -> String? {
+        guard let array = value as? [Any], let plan = int(array[safe: 0]) else { return nil }
+        switch plan {
+        case 2: return "PRO"
+        case 3, 6: return "ULTRA"
+        case 4: return "PLUS"
+        default: return nil
+        }
+    }
+
+    private static func date(in value: Any) -> Date? {
+        if let array = value as? [Any] {
+            if let seconds = number(array[safe: 0]),
+               seconds > 1_500_000_000,
+               seconds < 2_200_000_000 {
+                let nanos = number(array[safe: 1]) ?? 0
+                return Date(timeIntervalSince1970: seconds + nanos / 1_000_000_000)
+            }
+            for child in array {
+                if let date = date(in: child) {
+                    return date
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func int(_ value: Any?) -> Int? {
+        switch value {
+        case let value as Int: value
+        case let value as Double: Int(value)
+        case let value as NSNumber: value.intValue
+        case let value as String: Int(value)
+        default: nil
+        }
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        switch value {
+        case let value as Double: value
+        case let value as Int: Double(value)
+        case let value as NSNumber: value.doubleValue
+        case let value as String: Double(value)
+        default: nil
+        }
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+}
+
+private final class SnapshotBox: @unchecked Sendable {
+    var snapshot: UsageSnapshot?
 }
 
 /// Reads Cursor usage through the dashboard API, authenticated with the
@@ -3119,12 +3557,12 @@ private func renderSampleCards(to directory: String) {
                        secondary: window(70, reset: 3600 * 24 * 5), plan: "PLUS", updatedAt: Date(), error: nil),
          .expanded),
         ("gemini_expanded",
-         UsageSnapshot(provider: .gemini, primary: window(12, reset: 3600 * 9),
-                       secondary: nil, plan: "EST", updatedAt: Date(), error: nil),
+         UsageSnapshot(provider: .gemini, primary: window(12, reset: 3600 * 3),
+                       secondary: window(44, reset: 3600 * 24 * 4), plan: "PRO", updatedAt: Date(), error: nil),
          .expanded),
         ("gemini_compact",
-         UsageSnapshot(provider: .gemini, primary: window(12, reset: 3600 * 9),
-                       secondary: nil, plan: "EST", updatedAt: Date(), error: nil),
+         UsageSnapshot(provider: .gemini, primary: window(12, reset: 3600 * 3),
+                       secondary: window(44, reset: 3600 * 24 * 4), plan: "PRO", updatedAt: Date(), error: nil),
          .compact),
         ("cursor_regular",
          UsageSnapshot(provider: .cursor, primary: window(11, reset: 3600 * 24 * 1),
@@ -3191,6 +3629,28 @@ if let index = CommandLine.arguments.firstIndex(of: "--render-cards") {
         renderSampleCards(to: directory)
     }
     exit(0)
+}
+
+if CommandLine.arguments.contains("--print-gemini-usage") {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SnapshotBox()
+    Task.detached {
+        box.snapshot = await GeminiUsageCollector().collect()
+        semaphore.signal()
+    }
+    guard semaphore.wait(timeout: .now() + 20) == .success else {
+        FileHandle.standardError.write(Data("Gemini usage diagnostic timed out\n".utf8))
+        exit(124)
+    }
+    if let snapshot = box.snapshot {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(snapshot),
+           let json = String(data: data, encoding: .utf8) {
+            print(json)
+        }
+    }
+    exit(box.snapshot?.error == nil ? 0 : 1)
 }
 
 let app = NSApplication.shared
