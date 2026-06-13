@@ -1,5 +1,6 @@
 import AppKit
 import CommonCrypto
+import Darwin
 import Foundation
 import QuartzCore
 import Security
@@ -1601,6 +1602,37 @@ private extension Array {
 
 private final class SnapshotBox: @unchecked Sendable {
     var snapshot: UsageSnapshot?
+}
+
+private final class SingleInstanceLock {
+    private let descriptor: Int32
+
+    static func acquire(name: String) -> SingleInstanceLock? {
+        SingleInstanceLock(name: name)
+    }
+
+    private init?(name: String) {
+        let lockURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(name).lock")
+        let fd = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else { return nil }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            return nil
+        }
+
+        descriptor = fd
+        let pid = "\(getpid())\n"
+        _ = ftruncate(descriptor, 0)
+        pid.withCString { pointer in
+            _ = write(descriptor, pointer, strlen(pointer))
+        }
+    }
+
+    deinit {
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
 }
 
 /// Reads Cursor usage through the dashboard API, authenticated with the
@@ -3651,6 +3683,10 @@ if CommandLine.arguments.contains("--print-gemini-usage") {
         }
     }
     exit(box.snapshot?.error == nil ? 0 : 1)
+}
+
+guard let singleInstanceLock = SingleInstanceLock.acquire(name: "local.tokenbar") else {
+    exit(0)
 }
 
 let app = NSApplication.shared

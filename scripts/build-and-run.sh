@@ -30,6 +30,7 @@ xattr -cr "$APP" 2>/dev/null || true
 mkdir -p "$INSTALL_DIR" "$HOME/Library/LaunchAgents"
 launchctl unload "$PLIST" 2>/dev/null || true
 pkill -f "$INSTALLED_APP/Contents/MacOS/tokenbar" 2>/dev/null || true
+pkill -x tokenbar 2>/dev/null || true
 rm -rf "$INSTALLED_APP"
 cp -R "$APP" "$INSTALL_DIR/"
 xattr -cr "$INSTALLED_APP" 2>/dev/null || true
