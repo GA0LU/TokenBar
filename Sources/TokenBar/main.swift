@@ -62,7 +62,7 @@ enum Provider: String, CaseIterable, Codable, Sendable {
     var secondaryWindowLabel: String? {
         switch self {
         case .codex, .claude: "Wk"
-        case .gemini: nil
+        case .gemini: "Wk"
         case .cursor: "API"
         case .antigravity: "Wk"
         case .openrouter, .workbuddy: nil
@@ -1061,17 +1061,20 @@ actor ClaudeUsageCollector: UsageCollecting {
 }
 
 /// Estimates Gemini CLI quota usage by counting model responses in the local
-/// session logs. Daily free-tier cap is 1000 requests; the 5h window is a
-/// proportional local estimate because Gemini CLI logs do not expose server
-/// quota windows.
+/// session logs. Gemini Apps now expose both short-window and weekly limits on
+/// gemini.google.com/usage, but the CLI logs available locally do not include
+/// Google's server-side compute buckets, so TokenBar presents local daily and
+/// weekly estimates until an authenticated usage endpoint is available here.
 struct GeminiUsageCollector: UsageCollecting {
     let provider: Provider = .gemini
     // Gemini Code Assist / CLI daily request quota. Google AI Pro (this account's
     // tier, confirmed via Antigravity's "Google AI Pro" userTier) grants 1500/day,
     // shared between the CLI and IDE agent mode. (Free = 1000, Ultra = 2000.)
-    // Requests reset at midnight Pacific. There is no official 5-hour window for
-    // the CLI, so only the real daily limit is surfaced.
+    // Requests reset at midnight Pacific. The weekly value is a local 7-day
+    // estimate so the Touch Bar can mirror Gemini's weekly limit concept without
+    // scraping browser cookies or private web session state.
     private static let dailyLimit = 1500.0
+    private static let weeklyLimit = dailyLimit * 7
 
     private struct ChatLine: Decodable {
         let type: String?
@@ -1095,9 +1098,12 @@ struct GeminiUsageCollector: UsageCollecting {
         pacific.timeZone = TimeZone(identifier: "America/Los_Angeles") ?? .current
         let dayStart = pacific.startOfDay(for: Date())
         let dayEnd = dayStart.addingTimeInterval(24 * 3600)
+        let weekStart = Date().addingTimeInterval(-7 * 24 * 3600)
 
         let decoder = JSONDecoder()
         var dailyRequests = 0
+        var weeklyRequests = 0
+        var oldestWeekly: Date?
         var latest = Date.distantPast
         if let enumerator = FileManager.default.enumerator(
             at: gemini,
@@ -1113,7 +1119,7 @@ struct GeminiUsageCollector: UsageCollecting {
                       url.pathComponents.contains("chats"),
                       let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
                       values.isRegularFile == true,
-                      (values.contentModificationDate ?? .distantPast) >= dayStart else {
+                      (values.contentModificationDate ?? .distantPast) >= weekStart else {
                     continue
                 }
                 guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
@@ -1126,10 +1132,16 @@ struct GeminiUsageCollector: UsageCollecting {
                           let parsed = try? decoder.decode(ChatLine.self, from: data),
                           parsed.type == "gemini",
                           let date = UsageFormat.parseDate(parsed.timestamp),
-                          date >= dayStart else {
+                          date >= weekStart else {
                         return true
                     }
-                    dailyRequests += 1
+                    weeklyRequests += 1
+                    if oldestWeekly == nil || date < oldestWeekly! {
+                        oldestWeekly = date
+                    }
+                    if date >= dayStart {
+                        dailyRequests += 1
+                    }
                     latest = max(latest, date)
                     return true
                 }) {}
@@ -1142,7 +1154,10 @@ struct GeminiUsageCollector: UsageCollecting {
                 usedPercent: min(100, Double(dailyRequests) / dailyLimit * 100),
                 resetAt: dayEnd
             ),
-            secondary: nil,
+            secondary: LimitWindow(
+                usedPercent: min(100, Double(weeklyRequests) / weeklyLimit * 100),
+                resetAt: oldestWeekly?.addingTimeInterval(7 * 24 * 3600)
+            ),
             plan: "EST",
             updatedAt: latest == .distantPast ? Date() : latest,
             error: nil
