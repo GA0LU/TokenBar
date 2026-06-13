@@ -2481,6 +2481,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private weak var trayButton: NSButton?
     private weak var refreshButton: NSButton?
     private var timer: Timer?
+    private var didStop = false
     private var isRefreshing = false
     private var refreshAgain = false
     private var expandedProvider: Provider?
@@ -2511,6 +2512,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     func start() {
+        didStop = false
         NSApp.touchBar = touchBar
         installTrayItem()
         refresh()
@@ -2521,12 +2523,16 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     func stop() {
+        guard !didStop else { return }
+        didStop = true
         timer?.invalidate()
         timer = nil
         if let trayItem {
             ControlStrip.remove(trayItem)
         }
         ControlStrip.dismissModal(touchBar)
+        statusItem.isVisible = false
+        NSStatusBar.system.removeStatusItem(statusItem)
     }
 
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
@@ -2575,8 +2581,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         menu.addItem(settingsItem)
 
         menu.addItem(.separator())
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        quitItem.target = NSApp
+        let quitItem = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
         menu.addItem(quitItem)
         statusItem.menu = menu
     }
@@ -2661,6 +2667,26 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     @objc private func refreshPressed() {
         refresh()
+    }
+
+    @objc private func quitApp() {
+        stop()
+        disableLaunchAgent()
+        NSApp.terminate(nil)
+    }
+
+    private func disableLaunchAgent() {
+        let plist = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/local.tokenbar.plist")
+        guard FileManager.default.fileExists(atPath: plist.path) else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["unload", plist.path]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try? process.run()
+        process.waitUntilExit()
     }
 
     private func refresh() {
