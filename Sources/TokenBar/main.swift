@@ -335,7 +335,15 @@ enum UsageFormat {
 
 protocol UsageCollecting: Sendable {
     var provider: Provider { get }
-    func collect() async -> UsageSnapshot
+    /// - Parameter force: when true, bypass any internal time-based cache and
+    ///   fetch fresh data now. Used after the machine wakes from sleep and when
+    ///   the user taps refresh, so a long idle period syncs immediately instead
+    ///   of waiting out a throttle window.
+    func collect(force: Bool) async -> UsageSnapshot
+}
+
+extension UsageCollecting {
+    func collect() async -> UsageSnapshot { await collect(force: false) }
 }
 
 enum SecretStore {
@@ -636,10 +644,10 @@ final class UsageStore: @unchecked Sendable {
         }
     }
 
-    func refresh() async -> [UsageSnapshot] {
+    func refresh(force: Bool = false) async -> [UsageSnapshot] {
         let results = await withTaskGroup(of: UsageSnapshot.self) { group in
             for collector in collectors {
-                group.addTask { await collector.collect() }
+                group.addTask { await collector.collect(force: force) }
             }
             var values: [UsageSnapshot] = []
             for await value in group {
@@ -673,7 +681,7 @@ struct CodexAppServerCollector: UsageCollecting {
     let provider: Provider = .codex
     private let codexPath = "/Applications/Codex.app/Contents/Resources/codex"
 
-    func collect() async -> UsageSnapshot {
+    func collect(force _: Bool) async -> UsageSnapshot {
         await Task.detached(priority: .utility) {
             do {
                 return try readRateLimits()
@@ -834,57 +842,61 @@ actor ClaudeUsageCollector: UsageCollecting {
 
     private var cached: UsageSnapshot?
     private var cachedAt = Date.distantPast
-
     private var nextFetchAt = Date.distantPast
     private var consecutiveFailures = 0
     private var restoredFromDisk = false
-    private var tokensPerPercent: Double = 0
 
     private static let cacheDefaultsKey = "ClaudeUsageSnapshotCache"
-    private static let calibrationKey = "ClaudeTokensPerPercent"
-    private static let defaultTokensPerPercent: Double = 900_000
+    /// How long a cached/persisted reading is still treated as trustworthy. The
+    /// 5h window moves slowly, so a couple of minutes of staleness is invisible,
+    /// but beyond this we refuse to keep showing an old number as if it were live.
+    private static let maxCacheAge: TimeInterval = 30 * 60
+    /// Normal poll cadence. The endpoint tolerates a single user polling at this
+    /// rate; the rate-limiting only triggers under rapid repeated calls.
+    private static let pollInterval: TimeInterval = 120
 
-    func collect() async -> UsageSnapshot {
+    func collect(force: Bool) async -> UsageSnapshot {
         let now = Date()
         if !restoredFromDisk {
             restoredFromDisk = true
-            let stored = UserDefaults.standard.double(forKey: Self.calibrationKey)
-            tokensPerPercent = stored > 0 ? stored : Self.defaultTokensPerPercent
             if cached == nil,
                let data = UserDefaults.standard.data(forKey: Self.cacheDefaultsKey),
                let snapshot = try? JSONDecoder().decode(UsageSnapshot.self, from: data),
-               now.timeIntervalSince(snapshot.updatedAt) < 2 * 3600 {
+               now.timeIntervalSince(snapshot.updatedAt) < Self.maxCacheAge {
                 cached = snapshot
                 cachedAt = snapshot.updatedAt
             }
+            // Drop the obsolete calibration key from the old interpolation scheme.
+            UserDefaults.standard.removeObject(forKey: "ClaudeTokensPerPercent")
         }
-        // The usage endpoint rate-limits aggressively; poll it sparingly and
-        // serve interpolated real data in between (API truth plus tokens spent
-        // locally since, converted with a self-calibrating factor).
-        if now < nextFetchAt, let cached {
-            return await interpolated(cached)
-        }
-        guard now >= nextFetchAt else {
-            return .failure(.claude, "Claude usage API rate limited; retrying later")
+        // Serve the last real reading until the next poll is due. We no longer
+        // interpolate from local token logs: the server-side limit weights cache
+        // reads (the bulk of logged tokens) very differently, so any local
+        // token→percent estimate drifts away from the truth. Frequent polling of
+        // the authoritative number is both simpler and accurate. nextFetchAt is
+        // the single throttle, so failures back off instead of hammering. force
+        // bypasses it (wake-from-sleep / manual refresh) for an immediate sync.
+        if !force, now < nextFetchAt {
+            if let cached { return cached }
+            return .failure(.claude, "Loading")
         }
         do {
             let snapshot = try await readRealUsage()
-            await calibrate(against: snapshot)
             cached = snapshot
             cachedAt = now
             consecutiveFailures = 0
-            nextFetchAt = now.addingTimeInterval(300)
+            nextFetchAt = now.addingTimeInterval(Self.pollInterval)
             if let data = try? JSONEncoder().encode(snapshot) {
                 UserDefaults.standard.set(data, forKey: Self.cacheDefaultsKey)
             }
             return snapshot
         } catch {
             consecutiveFailures += 1
-            let backoff = min(300 * pow(2, Double(consecutiveFailures - 1)), 1800)
+            let backoff = min(Self.pollInterval * pow(2, Double(consecutiveFailures - 1)), 1800)
             nextFetchAt = now.addingTimeInterval(backoff)
-            // Stale real data beats a local guess; only estimate when we have
-            // never seen real numbers at all.
-            if let cached, now.timeIntervalSince(cachedAt) < 2 * 3600 {
+            // Recent real data beats a local guess; only estimate when the cached
+            // number is too old to trust (or we never had one).
+            if let cached, now.timeIntervalSince(cachedAt) < Self.maxCacheAge {
                 return cached
             }
             let message = error.localizedDescription
@@ -892,85 +904,6 @@ actor ClaudeUsageCollector: UsageCollecting {
                 Self.estimatedSnapshot() ?? .failure(.claude, message)
             }.value
         }
-    }
-
-    // MARK: Live interpolation between API polls
-
-    /// Bumps the cached 5h window by tokens spent locally since the last API
-    /// reading, so the display moves in near real time without extra API calls.
-    private func interpolated(_ snapshot: UsageSnapshot) async -> UsageSnapshot {
-        guard let primary = snapshot.primary else { return snapshot }
-        let since = cachedAt
-        let factor = tokensPerPercent
-        let extraTokens = await Task.detached(priority: .utility) {
-            Self.tokensInLogs(since: since)
-        }.value
-        guard extraTokens > 0 else { return snapshot }
-        let bumped = LimitWindow(
-            usedPercent: min(100, primary.usedPercent + Double(extraTokens) / factor),
-            resetAt: primary.resetAt
-        )
-        return UsageSnapshot(
-            provider: .claude,
-            primary: bumped,
-            secondary: snapshot.secondary,
-            plan: snapshot.plan,
-            updatedAt: snapshot.updatedAt,
-            error: nil
-        )
-    }
-
-    /// Learns how many tokens one utilization percent costs by comparing two
-    /// consecutive API readings against tokens logged locally in between.
-    private func calibrate(against snapshot: UsageSnapshot) async {
-        guard
-            let previous = cached?.primary,
-            let current = snapshot.primary
-        else { return }
-        let delta = current.usedPercent - previous.usedPercent
-        guard delta >= 0.5 else { return }
-        let since = cachedAt
-        let tokens = await Task.detached(priority: .utility) {
-            Self.tokensInLogs(since: since)
-        }.value
-        guard tokens > 0 else { return }
-        let measured = Double(tokens) / delta
-        tokensPerPercent = min(20_000_000, max(50_000, tokensPerPercent * 0.5 + measured * 0.5))
-        UserDefaults.standard.set(tokensPerPercent, forKey: Self.calibrationKey)
-    }
-
-    /// Total assistant tokens recorded in local session logs after `since`.
-    private static func tokensInLogs(since: Date) -> Int {
-        let projects = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/projects", isDirectory: true)
-        let files = recentJSONLFiles(in: projects, modifiedAfter: since.addingTimeInterval(-120))
-        guard !files.isEmpty else { return 0 }
-
-        let decoder = JSONDecoder()
-        var total = 0
-        for file in files {
-            guard let handle = try? FileHandle(forReadingFrom: file) else { continue }
-            defer { try? handle.close() }
-            var reader = LineReader(handle)
-            while autoreleasepool(invoking: {
-                guard let line = reader.next() else { return false }
-                guard line.contains("\"usage\""),
-                      let data = line.data(using: .utf8),
-                      let parsed = try? decoder.decode(LocalLine.self, from: data),
-                      (parsed.type == "assistant" || parsed.message?.role == "assistant"),
-                      let usage = parsed.message?.usage,
-                      let date = UsageFormat.parseDate(parsed.timestamp),
-                      date > since else {
-                    return true
-                }
-                total += (usage.input_tokens ?? 0)
-                    + (usage.output_tokens ?? 0)
-                    + (usage.cache_creation_input_tokens ?? 0)
-                    + (usage.cache_read_input_tokens ?? 0)
-                return true
-            }) {}
-        }
-        return total
     }
 
     // MARK: Real usage via OAuth
@@ -1311,7 +1244,7 @@ actor GeminiUsageCollector: UsageCollecting {
         let hl: String
     }
 
-    func collect() async -> UsageSnapshot {
+    func collect(force _: Bool) async -> UsageSnapshot {
         let now = Date()
         if let cached, now.timeIntervalSince(cachedAt) < 120 {
             return cached
@@ -1643,9 +1576,9 @@ actor CursorUsageCollector: UsageCollecting {
     private var cached: UsageSnapshot?
     private var cachedAt = Date.distantPast
 
-    func collect() async -> UsageSnapshot {
+    func collect(force: Bool) async -> UsageSnapshot {
         let now = Date()
-        if let cached, now.timeIntervalSince(cachedAt) < 60 {
+        if !force, let cached, now.timeIntervalSince(cachedAt) < 60 {
             return cached
         }
         do {
@@ -1831,7 +1764,7 @@ actor OpenRouterUsageCollector: UsageCollecting {
     private var cached: UsageSnapshot?
     private var cachedAt = Date.distantPast
 
-    func collect() async -> UsageSnapshot {
+    func collect(force _: Bool) async -> UsageSnapshot {
         let now = Date()
         do {
             let snapshot = try await fetchUsage()
@@ -1894,7 +1827,7 @@ actor WorkBuddyUsageCollector: UsageCollecting {
     private var cached: UsageSnapshot?
     private var cachedAt = Date.distantPast
 
-    func collect() async -> UsageSnapshot {
+    func collect(force _: Bool) async -> UsageSnapshot {
         let now = Date()
         do {
             let snapshot = try await fetchUsage()
@@ -2113,7 +2046,7 @@ actor WorkBuddyUsageCollector: UsageCollecting {
 struct AntigravityUsageCollector: UsageCollecting {
     let provider: Provider = .antigravity
 
-    func collect() async -> UsageSnapshot {
+    func collect(force _: Bool) async -> UsageSnapshot {
         await Task.detached(priority: .utility) {
             do {
                 return try Self.readUserStatus()
@@ -2484,6 +2417,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private var didStop = false
     private var isRefreshing = false
     private var refreshAgain = false
+    private var pendingForce = false
     private var expandedProvider: Provider?
     private var draggingProvider: Provider?
     private var suppressNextTapProvider: Provider?
@@ -2515,11 +2449,19 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         didStop = false
         NSApp.touchBar = touchBar
         installTrayItem()
-        refresh()
+        refresh(force: true)
         timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
         timer?.tolerance = 5
+        // Sync immediately when the machine wakes, so data is never stale after
+        // the Mac has been asleep (or shut) for hours or days.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
     }
 
     func stop() {
@@ -2527,12 +2469,23 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         didStop = true
         timer?.invalidate()
         timer = nil
+        NSWorkspace.shared.notificationCenter.removeObserver(
+            self,
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
         if let trayItem {
             ControlStrip.remove(trayItem)
         }
         ControlStrip.dismissModal(touchBar)
         statusItem.isVisible = false
         NSStatusBar.system.removeStatusItem(statusItem)
+    }
+
+    @objc private func systemDidWake() {
+        // After sleep the periodic timer may not fire promptly, so pull fresh
+        // data immediately and bypass each collector's throttle.
+        refresh(force: true)
     }
 
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
@@ -2666,7 +2619,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     @objc private func refreshPressed() {
-        refresh()
+        refresh(force: true)
     }
 
     @objc private func quitApp() {
@@ -2689,9 +2642,11 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         process.waitUntilExit()
     }
 
-    private func refresh() {
+    private func refresh(force: Bool = false) {
         if isRefreshing {
             refreshAgain = true
+            // Don't let a queued forced refresh be downgraded by a plain tick.
+            pendingForce = pendingForce || force
             return
         }
         isRefreshing = true
@@ -2699,13 +2654,15 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         refreshButton?.alphaValue = 0.4
 
         Task {
-            _ = await store.refresh()
+            _ = await store.refresh(force: force)
             await MainActor.run {
                 self.updateViews()
                 self.isRefreshing = false
                 if self.refreshAgain {
                     self.refreshAgain = false
-                    self.refresh()
+                    let nextForce = self.pendingForce
+                    self.pendingForce = false
+                    self.refresh(force: nextForce)
                 }
             }
         }
