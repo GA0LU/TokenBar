@@ -829,12 +829,20 @@ actor ClaudeUsageCollector: UsageCollecting {
     nonisolated let provider: Provider = .claude
 
     private static let keychainService = "Claude Code-credentials"
+    /// Public OAuth client ID for Claude Code — the same value ships in every
+    /// `claude` CLI binary, so it is an identifier, not a secret. An env var can
+    /// override it, but we must have a working default: the app runs from a
+    /// LaunchAgent with no custom environment, so requiring the env var meant
+    /// token refresh always failed there and usage froze once the access token
+    /// expired (~8h after login).
+    private static let defaultOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
     private static func oauthClientID() throws -> String {
-        guard let id = ProcessInfo.processInfo.environment["CLAUDE_OAUTH_CLIENT_ID"],
-              !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw CollectorError.message("Set CLAUDE_OAUTH_CLIENT_ID for Claude usage")
+        if let id = ProcessInfo.processInfo.environment["CLAUDE_OAUTH_CLIENT_ID"],
+           !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return id
         }
-        return id
+        return defaultOAuthClientID
     }
     private static let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
