@@ -853,6 +853,13 @@ actor ClaudeUsageCollector: UsageCollecting {
     private var nextFetchAt = Date.distantPast
     private var consecutiveFailures = 0
     private var restoredFromDisk = false
+    /// Last known-good OAuth tokens. Refresh tokens are single-use (each refresh
+    /// rotates them server-side), so if a rotated token is only written to the
+    /// keychain and that write silently fails, the chain is broken forever and
+    /// re-login is required — exactly the failure observed on 06-25. Memory is
+    /// therefore the primary holder; the keychain write is retried until it lands.
+    private var liveCredentials: Credentials?
+    private var keychainWriteFailed = false
 
     private static let cacheDefaultsKey = "ClaudeUsageSnapshotCache"
     /// How long a cached/persisted reading is still treated as trustworthy. The
@@ -900,7 +907,14 @@ actor ClaudeUsageCollector: UsageCollecting {
             return snapshot
         } catch {
             consecutiveFailures += 1
-            let backoff = min(Self.pollInterval * pow(2, Double(consecutiveFailures - 1)), 1800)
+            // A revoked refresh token can only be fixed by re-login; retrying
+            // sooner is pointless, so go straight to the longest backoff.
+            let backoff: Double
+            if case CollectorError.loginRequired = error {
+                backoff = 1800
+            } else {
+                backoff = min(Self.pollInterval * pow(2, Double(consecutiveFailures - 1)), 1800)
+            }
             nextFetchAt = now.addingTimeInterval(backoff)
             // Recent real data beats a local guess; only estimate when the cached
             // number is too old to trust (or we never had one).
@@ -924,8 +938,32 @@ actor ClaudeUsageCollector: UsageCollecting {
     }
 
     private func readRealUsage() async throws -> UsageSnapshot {
-        let stored = try loadKeychainObject()
-        var credentials = try credentials(from: stored)
+        let stored = (try? loadKeychainObject()) ?? [:]
+        let keychainCredentials = try? credentials(from: stored)
+
+        // Use whichever tokens are freshest. The keychain may have been rotated
+        // by the claude CLI (use theirs, or refreshing with our stale copy trips
+        // the server's reuse detection and revokes the whole token family), or
+        // our own last rotation may have failed to write back (memory is then
+        // the only holder of the valid tokens).
+        var credentials: Credentials
+        switch (liveCredentials, keychainCredentials) {
+        case let (memory?, keychain?):
+            credentials = memory.expiresAt >= keychain.expiresAt ? memory : keychain
+        case let (memory?, nil):
+            credentials = memory
+        case let (nil, keychain?):
+            credentials = keychain
+        case (nil, nil):
+            throw CollectorError.message("Claude credentials not found; run `claude` to login")
+        }
+
+        // A previous rotation may not have reached the keychain; keep retrying
+        // so the claude CLI eventually sees the rotated tokens too.
+        if keychainWriteFailed {
+            persist(credentials, mergingInto: stored)
+        }
+
         if credentials.expiresAt.timeIntervalSinceNow < 120 {
             credentials = try await refreshTokens(credentials, mergingInto: stored)
         }
@@ -994,12 +1032,20 @@ actor ClaudeUsageCollector: UsageCollecting {
         ])
 
         let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard
-            (response as? HTTPURLResponse)?.statusCode == 200,
+            status == 200,
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let accessToken = object["access_token"] as? String
         else {
-            throw CollectorError.message("Claude token refresh failed; run `claude` to re-login")
+            let body = String(data: data, encoding: .utf8) ?? ""
+            if body.contains("invalid_grant") {
+                // The refresh token was revoked server-side; our copies are dead.
+                // Drop the memory copy so a fresh `claude` login takes over.
+                liveCredentials = nil
+                throw CollectorError.loginRequired
+            }
+            throw CollectorError.message("Claude token refresh failed (HTTP \(status))")
         }
 
         var updated = credentials
@@ -1009,6 +1055,9 @@ actor ClaudeUsageCollector: UsageCollecting {
         }
         let lifetime = (object["expires_in"] as? NSNumber)?.doubleValue ?? 3600
         updated.expiresAt = Date().addingTimeInterval(lifetime)
+        // Memory first — the rotated refresh token must never be lost, even if
+        // the keychain write below fails.
+        liveCredentials = updated
         persist(updated, mergingInto: stored)
         return updated
     }
@@ -1062,12 +1111,18 @@ actor ClaudeUsageCollector: UsageCollecting {
             let data = try? JSONSerialization.data(withJSONObject: root),
             let json = String(data: data, encoding: .utf8)
         else { return }
-        _ = try? Self.runProcess("/usr/bin/security", [
-            "add-generic-password", "-U",
-            "-s", Self.keychainService,
-            "-a", NSUserName(),
-            "-w", json
-        ])
+        do {
+            _ = try Self.runProcess("/usr/bin/security", [
+                "add-generic-password", "-U",
+                "-s", Self.keychainService,
+                "-a", NSUserName(),
+                "-w", json
+            ])
+            keychainWriteFailed = false
+        } catch {
+            // Memory still holds the rotated tokens; retried on the next poll.
+            keychainWriteFailed = true
+        }
     }
 
     private static func runProcess(_ path: String, _ arguments: [String]) throws -> String {
@@ -2334,11 +2389,13 @@ struct AntigravityUsageCollector: UsageCollecting {
 enum CollectorError: LocalizedError {
     case message(String)
     case unauthorized
+    case loginRequired
 
     var errorDescription: String? {
         switch self {
         case .message(let message): message
         case .unauthorized: "Claude token rejected; run `claude` to re-login"
+        case .loginRequired: "Claude login expired — run `claude` in Terminal to re-login"
         }
     }
 }
