@@ -52,7 +52,10 @@ enum Provider: String, CaseIterable, Codable, Sendable {
 
     var primaryWindowLabel: String {
         switch self {
-        case .codex, .claude: "5h"
+        // Codex (ChatGPT merged billing) now has a single weekly window: the
+        // app-server reports primary windowDurationMins 10080 and secondary null.
+        case .codex: "Wk"
+        case .claude: "5h"
         case .gemini: "5h"
         case .cursor: "All"
         case .antigravity: "5h"
@@ -63,7 +66,8 @@ enum Provider: String, CaseIterable, Codable, Sendable {
 
     var secondaryWindowLabel: String? {
         switch self {
-        case .codex, .claude: "Wk"
+        case .codex: nil
+        case .claude: "Wk"
         case .gemini: "Wk"
         case .cursor: "API"
         case .antigravity: "Wk"
