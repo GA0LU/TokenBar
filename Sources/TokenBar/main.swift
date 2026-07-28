@@ -857,6 +857,9 @@ actor ClaudeUsageCollector: UsageCollecting {
     private var nextFetchAt = Date.distantPast
     private var consecutiveFailures = 0
     private var restoredFromDisk = false
+    /// Human-readable reason of the last fetch failure, surfaced while we sit in
+    /// backoff instead of a bare "Loading" that hides what actually went wrong.
+    private var lastFailureMessage: String?
     /// Last known-good OAuth tokens. Refresh tokens are single-use (each refresh
     /// rotates them server-side), so if a rotated token is only written to the
     /// keychain and that write silently fails, the chain is broken forever and
@@ -897,13 +900,21 @@ actor ClaudeUsageCollector: UsageCollecting {
         // bypasses it (wake-from-sleep / manual refresh) for an immediate sync.
         if !force, now < nextFetchAt {
             if let cached { return cached }
-            return .failure(.claude, "Loading")
+            // In backoff with nothing cached: serve the local estimate (plan
+            // "EST") so the column still shows numbers, and when even that is
+            // unavailable surface the real error (e.g. login required) instead
+            // of a bare "Loading".
+            let message = lastFailureMessage ?? "Loading"
+            return await Task.detached(priority: .utility) {
+                Self.estimatedSnapshot() ?? .failure(.claude, message)
+            }.value
         }
         do {
             let snapshot = try await readRealUsage()
             cached = snapshot
             cachedAt = now
             consecutiveFailures = 0
+            lastFailureMessage = nil
             nextFetchAt = now.addingTimeInterval(Self.pollInterval)
             if let data = try? JSONEncoder().encode(snapshot) {
                 UserDefaults.standard.set(data, forKey: Self.cacheDefaultsKey)
@@ -926,6 +937,7 @@ actor ClaudeUsageCollector: UsageCollecting {
                 return cached
             }
             let message = error.localizedDescription
+            lastFailureMessage = message
             return await Task.detached(priority: .utility) {
                 Self.estimatedSnapshot() ?? .failure(.claude, message)
             }.value
@@ -1235,7 +1247,10 @@ actor ClaudeUsageCollector: UsageCollecting {
                 resetAt: oldestWeekly?.addingTimeInterval(7 * 24 * 3600)
             ),
             plan: "EST",
-            updatedAt: latest == .distantPast ? now : latest,
+            // Stamp with the current time: the store treats snapshots older than
+            // ten minutes as stale and would otherwise overwrite this estimate
+            // with an error as soon as the logs pause.
+            updatedAt: now,
             error: nil
         )
     }
