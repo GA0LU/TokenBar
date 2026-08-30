@@ -52,9 +52,9 @@ enum Provider: String, CaseIterable, Codable, Sendable {
 
     var primaryWindowLabel: String {
         switch self {
-        // Codex (ChatGPT merged billing) now has a single weekly window: the
-        // app-server reports primary windowDurationMins 10080 and secondary null.
-        case .codex: "Wk"
+        // Codex labels come from the server-reported window duration; these are
+        // only the fallback used before the first reading arrives.
+        case .codex: "5h"
         case .claude: "5h"
         case .gemini: "5h"
         case .cursor: "All"
@@ -66,7 +66,7 @@ enum Provider: String, CaseIterable, Codable, Sendable {
 
     var secondaryWindowLabel: String? {
         switch self {
-        case .codex: nil
+        case .codex: "Wk"
         case .claude: "Wk"
         case .gemini: "Wk"
         case .cursor: "API"
@@ -196,15 +196,33 @@ struct LimitWindow: Codable, Sendable {
     let usedPercent: Double
     let resetAt: Date?
     let valueText: String?
+    /// Window name derived from the provider's own reported duration, used in
+    /// place of the provider's hard-coded label. Providers reshape their limit
+    /// windows over time (Codex dropped its 5h window and later restored it),
+    /// so a served label keeps the display correct without a code change.
+    let label: String?
 
-    init(usedPercent: Double, resetAt: Date?, valueText: String? = nil) {
+    init(usedPercent: Double, resetAt: Date?, valueText: String? = nil, label: String? = nil) {
         self.usedPercent = usedPercent
         self.resetAt = resetAt
         self.valueText = valueText
+        self.label = label
     }
 
     var remainingPercent: Double {
         max(0, min(100, 100 - usedPercent))
+    }
+
+    /// Compact name for a window of `minutes` length, e.g. 300 -> "5h",
+    /// 10080 -> "Wk", 1440 -> "Day".
+    static func label(forDurationMinutes minutes: Double) -> String? {
+        guard minutes > 0 else { return nil }
+        if minutes < 60 { return "\(Int(minutes))m" }
+        if minutes < 1440 { return "\(Int((minutes / 60).rounded()))h" }
+        if minutes < 2880 { return "Day" }
+        if minutes == 10080 { return "Wk" }
+        if (40320...44640).contains(minutes) { return "Mo" }
+        return "\(Int((minutes / 1440).rounded()))d"
     }
 }
 
@@ -239,6 +257,18 @@ struct UsageSnapshot: Codable, Sendable {
     }
 
     var isUsable: Bool { error == nil && (primary != nil || secondary != nil) }
+
+    /// Window names to draw. A label served with the reading wins over the
+    /// provider's static one, so a provider reshaping its limit windows shows
+    /// correctly without a code change.
+    var primaryLabel: String {
+        primary?.label ?? provider.primaryWindowLabel
+    }
+
+    var secondaryLabel: String? {
+        guard secondary != nil else { return nil }
+        return secondary?.label ?? provider.secondaryWindowLabel
+    }
 
     static func failure(_ provider: Provider, _ message: String) -> UsageSnapshot {
         UsageSnapshot(
@@ -798,10 +828,17 @@ struct CodexAppServerCollector: UsageCollecting {
         guard let snapshot else { return nil }
 
         let plan = (snapshot["planType"] as? String)?.uppercased()
+        // Codex reshapes its windows over time (the 5h window disappeared when
+        // billing merged with ChatGPT, then came back), so keep whichever
+        // windows are served and label them by their reported duration. When
+        // only one window exists it becomes primary and the card renders as a
+        // single row on its own.
+        let windows = [parseWindow(snapshot["primary"]), parseWindow(snapshot["secondary"])]
+            .compactMap { $0 }
         return UsageSnapshot(
             provider: .codex,
-            primary: parseWindow(snapshot["primary"]),
-            secondary: parseWindow(snapshot["secondary"]),
+            primary: windows.first,
+            secondary: windows.count > 1 ? windows[1] : nil,
             plan: plan,
             updatedAt: Date(),
             error: nil
@@ -814,7 +851,9 @@ struct CodexAppServerCollector: UsageCollecting {
             return nil
         }
         let reset = number(dictionary["resetsAt"]).map { Date(timeIntervalSince1970: $0) }
-        return LimitWindow(usedPercent: used, resetAt: reset)
+        let label = number(dictionary["windowDurationMins"])
+            .flatMap(LimitWindow.label(forDurationMinutes:))
+        return LimitWindow(usedPercent: used, resetAt: reset, label: label)
     }
 
     private func number(_ value: Any?) -> Double? {
@@ -3251,7 +3290,7 @@ final class ProviderUsageView: NSView {
         switch mode {
         case .compact:
             drawDenseWindow(
-                label: snapshot.provider.primaryWindowLabel,
+                label: snapshot.primaryLabel,
                 window: snapshot.primary,
                 y: 15,
                 labelX: 29,
@@ -3260,7 +3299,7 @@ final class ProviderUsageView: NSView {
                 segmentCount: 5,
                 fontSize: 8
             )
-            if let secondaryLabel = snapshot.provider.secondaryWindowLabel {
+            if let secondaryLabel = snapshot.secondaryLabel {
                 drawDenseWindow(
                     label: secondaryLabel,
                     window: snapshot.secondary,
@@ -3274,7 +3313,7 @@ final class ProviderUsageView: NSView {
             }
         case .medium:
             drawDenseWindow(
-                label: snapshot.provider.primaryWindowLabel,
+                label: snapshot.primaryLabel,
                 window: snapshot.primary,
                 y: 15,
                 labelX: 31,
@@ -3283,7 +3322,7 @@ final class ProviderUsageView: NSView {
                 segmentCount: 5,
                 fontSize: 8.5
             )
-            if let secondaryLabel = snapshot.provider.secondaryWindowLabel {
+            if let secondaryLabel = snapshot.secondaryLabel {
                 drawDenseWindow(
                     label: secondaryLabel,
                     window: snapshot.secondary,
@@ -3302,13 +3341,13 @@ final class ProviderUsageView: NSView {
         case .single:
             drawSingle()
         case .regular:
-            if let secondaryLabel = snapshot.provider.secondaryWindowLabel {
-                let column = windowLabelColumnWidth(snapshot.provider.primaryWindowLabel, secondaryLabel)
-                drawWindow(label: snapshot.provider.primaryWindowLabel, window: snapshot.primary, y: 15, labelColumnWidth: column)
+            if let secondaryLabel = snapshot.secondaryLabel {
+                let column = windowLabelColumnWidth(snapshot.primaryLabel, secondaryLabel)
+                drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: 15, labelColumnWidth: column)
                 drawWindow(label: secondaryLabel, window: snapshot.secondary, y: 3, labelColumnWidth: column)
             } else {
-                let column = windowLabelColumnWidth(snapshot.provider.primaryWindowLabel)
-                drawWindow(label: snapshot.provider.primaryWindowLabel, window: snapshot.primary, y: 9, labelColumnWidth: column)
+                let column = windowLabelColumnWidth(snapshot.primaryLabel)
+                drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: 9, labelColumnWidth: column)
             }
         }
     }
@@ -3368,13 +3407,13 @@ final class ProviderUsageView: NSView {
 
         let startX: CGFloat = 94
         let barWidth = max(120, bounds.width - 194)
-        if let secondaryLabel = snapshot.provider.secondaryWindowLabel {
-            let column = windowLabelColumnWidth(snapshot.provider.primaryWindowLabel, secondaryLabel)
-            drawWindow(label: snapshot.provider.primaryWindowLabel, window: snapshot.primary, y: 15, startX: startX, barWidth: barWidth, labelColumnWidth: column)
+        if let secondaryLabel = snapshot.secondaryLabel {
+            let column = windowLabelColumnWidth(snapshot.primaryLabel, secondaryLabel)
+            drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: 15, startX: startX, barWidth: barWidth, labelColumnWidth: column)
             drawWindow(label: secondaryLabel, window: snapshot.secondary, y: 3, startX: startX, barWidth: barWidth, labelColumnWidth: column)
         } else {
-            let column = windowLabelColumnWidth(snapshot.provider.primaryWindowLabel)
-            drawWindow(label: snapshot.provider.primaryWindowLabel, window: snapshot.primary, y: 9, startX: startX, barWidth: barWidth, labelColumnWidth: column)
+            let column = windowLabelColumnWidth(snapshot.primaryLabel)
+            drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: 9, startX: startX, barWidth: barWidth, labelColumnWidth: column)
         }
     }
 
@@ -3421,13 +3460,13 @@ final class ProviderUsageView: NSView {
             return
         }
 
-        if let secondaryLabel = snapshot.provider.secondaryWindowLabel {
-            let column = windowLabelColumnWidth(snapshot.provider.primaryWindowLabel, secondaryLabel)
-            drawWindow(label: snapshot.provider.primaryWindowLabel, window: snapshot.primary, y: 15, startX: startX, barWidth: barWidth, labelColumnWidth: column)
+        if let secondaryLabel = snapshot.secondaryLabel {
+            let column = windowLabelColumnWidth(snapshot.primaryLabel, secondaryLabel)
+            drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: 15, startX: startX, barWidth: barWidth, labelColumnWidth: column)
             drawWindow(label: secondaryLabel, window: snapshot.secondary, y: 3, startX: startX, barWidth: barWidth, labelColumnWidth: column)
         } else {
-            let column = windowLabelColumnWidth(snapshot.provider.primaryWindowLabel)
-            drawWindow(label: snapshot.provider.primaryWindowLabel, window: snapshot.primary, y: 9, startX: startX, barWidth: barWidth, labelColumnWidth: column)
+            let column = windowLabelColumnWidth(snapshot.primaryLabel)
+            drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: 9, startX: startX, barWidth: barWidth, labelColumnWidth: column)
         }
     }
 
