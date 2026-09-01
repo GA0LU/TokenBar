@@ -12,7 +12,7 @@ INSTALLED_APP="$INSTALL_DIR/$APP_NAME.app"
 LABEL="$BUNDLE_ID"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
-swift build -c release
+swift build -c release --disable-sandbox
 
 BINARY="$ROOT/.build/release/tokenbar"
 rm -rf "$APP"
@@ -54,5 +54,5 @@ cat > "$PLIST" <<PLIST_EOF
 </plist>
 PLIST_EOF
 
-launchctl load "$PLIST"
+launchctl load "$PLIST" || launchctl bootstrap gui/"$UID" "$PLIST" || true
 echo "Installed and launched: $INSTALLED_APP"

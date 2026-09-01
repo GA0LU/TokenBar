@@ -40,7 +40,7 @@ enum Provider: String, CaseIterable, Codable, Sendable {
 
     var appPath: String {
         switch self {
-        case .codex: "/Applications/Codex.app"
+        case .codex: "/Applications/ChatGPT.app"
         case .claude: "/Applications/Claude.app"
         case .gemini: "/Applications/Gemini.app"
         case .cursor: "/Applications/Cursor.app"
@@ -713,7 +713,7 @@ final class UsageStore: @unchecked Sendable {
 
 struct CodexAppServerCollector: UsageCollecting {
     let provider: Provider = .codex
-    private let codexPath = "/Applications/Codex.app/Contents/Resources/codex"
+    private let codexPath = "/Applications/ChatGPT.app/Contents/Resources/codex"
 
     func collect(force _: Bool) async -> UsageSnapshot {
         await Task.detached(priority: .utility) {
@@ -727,7 +727,7 @@ struct CodexAppServerCollector: UsageCollecting {
 
     private func readRateLimits() throws -> UsageSnapshot {
         guard FileManager.default.isExecutableFile(atPath: codexPath) else {
-            throw CollectorError.message("Codex CLI not found in /Applications/Codex.app")
+            throw CollectorError.message("Codex CLI not found in /Applications/ChatGPT.app")
         }
 
         let process = Process()
@@ -2523,6 +2523,261 @@ enum ControlStrip {
     }
 }
 
+// MARK: - Agent run-status monitoring
+// Claude Code / Codex: local hooks write ~/.tokenbar/state-<provider>.json.
+// WorkBuddy: coarse heuristic (process + recent support-dir activity), no hook API.
+
+enum AgentState: String {
+    case working, waiting, idle, unknown
+}
+
+struct AgentStatus {
+    let state: AgentState
+    let project: String?
+    let summary: String
+    let updatedAt: Date?
+}
+
+@MainActor
+final class AgentStatusMonitor {
+    static let shared = AgentStatusMonitor()
+    private let stateDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".tokenbar")
+    /// Last WorkBuddy project pick, kept for the hysteresis in
+    /// `workBuddyLiveSession()` so multi-window heartbeat races don't make the
+    /// project name flip-flop on the card.
+    private var lastWorkBuddyPick: (touch: Date, name: String)?
+
+    func status(for provider: Provider) -> AgentStatus {
+        switch provider {
+        case .claude:
+            return hookStatus(provider: provider)
+        case .codex:
+            // Desktop Codex (ChatGPT.app) never runs our hooks — its app-server
+            // only loads hooks.json at launch, and a fresh install has no
+            // /hooks trust approval, so the hook file can sit stale for days.
+            // Its sqlite thread store, however, updates on every turn. Prefer
+            // it; fall back to the hook file for plain `codex` CLI sessions.
+            let desktop = codexDesktopStatus()
+            if desktop.state != .unknown {
+                return desktop
+            }
+            return hookStatus(provider: provider)
+        case .workbuddy:
+            return workbuddyStatus()
+        default:
+            return AgentStatus(state: .unknown, project: nil, summary: "", updatedAt: nil)
+        }
+    }
+
+    /// Desktop Codex (ChatGPT.app) liveness heuristic. The app-server keeps a
+    /// per-thread row in ~/.codex/state_5.sqlite whose `updated_at_ms` is
+    /// bumped every time the user submits a turn — a natural heartbeat, no
+    /// hooks involved. The freshest non-archived thread is the session the
+    /// user is looking at; its `cwd` is the project the card should show.
+    /// Uses sqlite3 -readonly so we never contend with the app-server's own
+    /// writes, and returns .unknown when the database is missing/unreadable
+    /// so the caller can fall back to the hook state file.
+    private func codexDesktopStatus() -> AgentStatus {
+        let db = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/state_5.sqlite").path
+        let out = capture(
+            "/usr/bin/sqlite3",
+            ["-readonly", "-noheader", "-separator", "|",
+             db,
+             "SELECT cwd, updated_at_ms FROM threads WHERE archived=0 ORDER BY updated_at_ms DESC LIMIT 1"]
+        )
+        // One line: "/Users/gchyang/Documents/Codex/2026-09-01/qing|1788230130"
+        guard let line = out.split(separator: "\n").first else {
+            return AgentStatus(state: .unknown, project: nil, summary: "", updatedAt: nil)
+        }
+        let parts = line.split(separator: "|", maxSplits: 1)
+        guard parts.count == 2,
+              let updatedMs = Double(parts[1]),
+              updatedMs > 0 else {
+            return AgentStatus(state: .unknown, project: nil, summary: "", updatedAt: nil)
+        }
+        let updated = Date(timeIntervalSince1970: updatedMs / 1000)
+        let age = Date().timeIntervalSince(updated)
+        let project = parts[0].isEmpty ? nil : URL(fileURLWithPath: String(parts[0])).lastPathComponent
+        // Same contract as the WorkBuddy heartbeat channel: a turn within the
+        // window is "working", anything older is idle. 180s matches the
+        // working-expiry in hookStatus(): a finished turn stops bumping
+        // updated_at_ms (verified — desktop Codex only writes it on turn
+        // submit/end, not during generation), so 360s made the card hang on
+        // "干活中" for up to six minutes after a short task ended.
+        let idle = age > 180
+        let summary = project.map { idle ? "空闲 · \($0)" : "干活中 · \($0)" } ?? (idle ? "空闲" : "干活中")
+        return AgentStatus(
+            state: idle ? .idle : .working,
+            project: project,
+            summary: summary,
+            updatedAt: idle ? nil : updated
+        )
+    }
+
+    private func hookStatus(provider: Provider) -> AgentStatus {
+        let file = stateDir.appendingPathComponent("state-\(provider.rawValue.lowercased()).json")
+        guard let data = try? Data(contentsOf: file),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let event = obj["event"] as? String else {
+            return AgentStatus(state: .unknown, project: nil, summary: "无状态", updatedAt: nil)
+        }
+        let ts = (obj["ts"] as? TimeInterval) ?? 0
+        let updatedAt = Date(timeIntervalSince1970: ts)
+        let age = Date().timeIntervalSince(updatedAt)
+        let project = (obj["cwd"] as? String).flatMap { URL(fileURLWithPath: $0).lastPathComponent }
+        // Which tool the agent is currently driving (Bash / Read / Write ...),
+        // captured by the hook on Pre/PostToolUse. Makes "干活中" concrete.
+        let tool = (obj["tool"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+
+        var state: AgentState
+        switch event {
+        case "Notification", "PermissionRequest": state = .waiting
+        case "Stop", "SessionEnd", "SubagentStop": state = .idle
+        case "UserPromptSubmit", "PreToolUse", "PostToolUse": state = .working
+        default: state = .unknown
+        }
+        // Both live states go stale. A hook that never fires again (session
+        // killed, tab closed, machine slept) leaves its last event behind, and
+        // without this a PermissionRequest from hours ago would pin the card to
+        // "等你确认" forever. Waiting gets a longer window — an unanswered
+        // permission prompt can legitimately sit there for a few minutes.
+        if state == .working && age > 180 { state = .idle }
+        if state == .waiting && age > 600 { state = .idle }
+
+        let stateText = Self.stateText(state)
+        var summary = stateText
+        if let project, !project.isEmpty {
+            summary += " · \(project)"
+        }
+        if state == .working, let tool {
+            summary += " · \(tool)"
+        }
+        return AgentStatus(state: state, project: project, summary: summary, updatedAt: updatedAt)
+    }
+
+    private func workbuddyStatus() -> AgentStatus {
+        let running = shell("pgrep -f '/Applications/WorkBuddy.app' >/dev/null 2>&1")
+        guard running else {
+            return AgentStatus(state: .idle, project: nil, summary: "未运行", updatedAt: nil)
+        }
+        // WorkBuddy has no hook API (its CLI only supports in-process SDK hooks,
+        // not shell commands), so fall back to session heartbeats.
+        let (project, lastActivity) = workBuddyLiveSession()
+        // ~2 heartbeat periods, so the card doesn't flip while one is in flight.
+        let idle = lastActivity.map { Date().timeIntervalSince($0) > 360 } ?? true
+        let summary: String
+        if let project {
+            summary = idle ? "空闲 · \(project)" : "干活中 · \(project)"
+        } else {
+            summary = idle ? "空闲" : "干活中"
+        }
+        return AgentStatus(
+            state: idle ? .idle : .working,
+            project: project,
+            summary: summary,
+            updatedAt: idle ? nil : lastActivity
+        )
+    }
+
+    /// WorkBuddy liveness heuristic. The Electron support dir under ~/Library
+    /// almost never writes (the old mtime scan there read "idle" almost always);
+    /// what does move is ~/.workbuddy/sessions/*.json, whose `lastHeartbeat`
+    /// refreshes while a session is alive.
+    ///
+    /// Only *real project* sessions count: the host CLI session lives under
+    /// /var/folders and stays fresh as long as the app is open (which made the
+    /// card read "干活中" forever), and prewarm sessions have cwd=="/". The
+    /// returned pair is the freshest such session's project + heartbeat, so the
+    /// card name and the working/idle decision always agree on one session.
+    private func workBuddyLiveSession() -> (project: String?, latest: Date?) {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".workbuddy/sessions")
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        ) else {
+            return (nil, nil)
+        }
+        var best: (touch: Date, name: String)?
+        for file in files where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let cwd = obj["cwd"] as? String,
+                  !cwd.contains("/var/folders/"),
+                  !cwd.contains("__workbuddy_cli_host__"),
+                  cwd != "/" else {
+                continue
+            }
+            // Prefer the CLI's own heartbeat stamp over the file mtime: the file
+            // can be rewritten by unrelated bookkeeping.
+            var touch = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? .distantPast
+            if let heartbeatMs = (obj["lastHeartbeat"] as? NSNumber)?.doubleValue {
+                let heartbeat = Date(timeIntervalSince1970: heartbeatMs / 1000)
+                if heartbeat > touch { touch = heartbeat }
+            }
+            if best == nil || touch > best!.touch {
+                best = (touch, URL(fileURLWithPath: cwd).lastPathComponent)
+            }
+        }
+        guard var best else { return (nil, nil) }
+
+        // WorkBuddy refreshes the heartbeat of every open session on any
+        // activity, so with two windows open the "freshest" project flip-flops
+        // every few seconds. Hold the current pick unless another session is
+        // clearly newer (hysteresis), otherwise the card name is unreadable.
+        if let previous = lastWorkBuddyPick, best.touch.timeIntervalSince(previous.touch) < 90 {
+            best = previous
+        }
+        lastWorkBuddyPick = best
+        return (best.name, best.touch)
+    }
+
+    private static func stateText(_ s: AgentState) -> String {
+        switch s {
+        case .working: return "干活中"
+        case .waiting: return "等你确认"
+        case .idle: return "空闲"
+        case .unknown: return "未知"
+        }
+    }
+
+    private func shell(_ cmd: String) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", cmd]
+        do {
+            try p.run()
+            p.waitUntilExit()
+            return p.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    /// Runs a binary and returns its stdout. Used by `codexDesktopStatus()` to
+    /// query the sqlite thread store; sqlite3 answers in milliseconds so this
+    /// is safe to call from the main actor's status timer.
+    private func capture(_ executable: String, _ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: executable)
+        p.arguments = args
+        let outPipe = Pipe()
+        p.standardOutput = outPipe
+        p.standardError = Pipe()
+        do {
+            try p.run()
+            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return String(data: data, encoding: .utf8) ?? ""
+        } catch {
+            return ""
+        }
+    }
+}
+
 @MainActor
 final class TouchBarController: NSObject, NSTouchBarDelegate {
     private static let detailIdentifier = NSTouchBarItem.Identifier("TokenBar.detail")
@@ -2537,6 +2792,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private weak var trayButton: NSButton?
     private weak var refreshButton: NSButton?
     private var timer: Timer?
+    private var watchdogTimer: Timer?
+    private var statusTimer: Timer?
     private var didStop = false
     private var isRefreshing = false
     private var refreshAgain = false
@@ -2585,6 +2842,52 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             name: NSWorkspace.didWakeNotification,
             object: nil
         )
+        // Keep-alive: the full-width cards use a system-modal presentation that
+        // macOS dismisses on app switch / wake / etc. Re-present on activation,
+        // after wake, and via a periodic watchdog so they come back on their own.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        // The system-modal is dismissed on EVERY app switch, not just when we
+        // deactivate — and presentModal is a no-op while TokenBar stays inactive,
+        // so the watchdog alone can never recover the cards after the user clicks
+        // into another app. Watch for ANY app activation and re-present shortly
+        // after the switch settles; presenting an already-visible modal is a no-op,
+        // so this is safe on repeated activations.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(anyAppDidActivate),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.showTouchBar() }
+        }
+        watchdogTimer?.tolerance = 5
+        // Agent run-state refreshes from local hook files (Claude/Codex) and a
+        // process+file heuristic (WorkBuddy) are cheap and don't hit any API, so
+        // they can run at 10s for near-real-time "干活中/等你确认" feedback while
+        // token quotas stay on the 20s network-throttled cycle.
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshStatusViews() }
+        }
+        statusTimer?.tolerance = 2
+    }
+
+    @objc private func appDidBecomeActive() {
+        showTouchBar()
+    }
+
+    @objc private func anyAppDidActivate() {
+        // The user just switched to (or between) apps — the exact event that made
+        // macOS dismiss our cards. Wait for the switch to settle, then bring the
+        // cards back so they feel persistent instead of vanishing on focus change.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.showTouchBar()
+        }
     }
 
     func stop() {
@@ -2592,9 +2895,23 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         didStop = true
         timer?.invalidate()
         timer = nil
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        statusTimer?.invalidate()
+        statusTimer = nil
         NSWorkspace.shared.notificationCenter.removeObserver(
             self,
             name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.removeObserver(
+            self,
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSApplication.didBecomeActiveNotification,
             object: nil
         )
         if let trayItem {
@@ -2609,6 +2926,11 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         // After sleep the periodic timer may not fire promptly, so pull fresh
         // data immediately and bypass each collector's throttle.
         refresh(force: true)
+        // macOS dismisses the system-modal Touch Bar on wake; bring it back once
+        // the display has settled.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.showTouchBar()
+        }
     }
 
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
@@ -2800,6 +3122,13 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         refreshButton?.alphaValue = 1
     }
 
+    /// Status-only refresh: rebuilds the Touch Bar cards and tray icon from the
+    /// cached snapshots (no network). Called by the 10s status timer.
+    private func refreshStatusViews() {
+        detailItem?.view = makeDetailView()
+        trayButton?.image = makeTrayImage()
+    }
+
     private func makeDetailView() -> NSView {
         let snapshots = visibleSnapshots()
         if let expandedProvider, !snapshots.contains(where: { $0.provider == expandedProvider }) {
@@ -2846,7 +3175,11 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
                 button.addGestureRecognizer(press)
             }
 
-            let view = ProviderUsageView(snapshot: snapshot, mode: mode)
+            let view = ProviderUsageView(
+                snapshot: snapshot,
+                mode: mode,
+                status: AgentStatusMonitor.shared.status(for: snapshot.provider)
+            )
             view.translatesAutoresizingMaskIntoConstraints = false
             button.addSubview(view)
             NSLayoutConstraint.activate([
@@ -2954,6 +3287,19 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
                 )
                 UsageFormat.remainingColor(remaining).setFill()
                 fill.fill()
+            }
+
+            // Agent run-state dot above the bar: green = working, orange = waiting
+            // for confirmation. Idle/unknown leave the bar clean.
+            switch AgentStatusMonitor.shared.status(for: provider).state {
+            case .working:
+                NSColor.systemGreen.setFill()
+                NSBezierPath(ovalIn: NSRect(x: x + 1.5, y: 21, width: 3, height: 3)).fill()
+            case .waiting:
+                NSColor.systemOrange.setFill()
+                NSBezierPath(ovalIn: NSRect(x: x + 1.5, y: 21, width: 3, height: 3)).fill()
+            default:
+                break
             }
         }
 
@@ -3237,10 +3583,12 @@ final class ProviderUsageView: NSView {
 
     private let snapshot: UsageSnapshot
     private let mode: Mode
+    private let status: AgentStatus?
 
-    init(snapshot: UsageSnapshot, mode: Mode = .regular) {
+    init(snapshot: UsageSnapshot, mode: Mode = .regular, status: AgentStatus? = nil) {
         self.snapshot = snapshot
         self.mode = mode
+        self.status = status
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 5
@@ -3287,6 +3635,10 @@ final class ProviderUsageView: NSView {
             return
         }
 
+        if (mode == .compact || mode == .collapsed), status.map({ !$0.summary.isEmpty }) == true {
+            drawStatusDot()
+        }
+
         switch mode {
         case .compact:
             drawDenseWindow(
@@ -3312,6 +3664,7 @@ final class ProviderUsageView: NSView {
                 )
             }
         case .medium:
+            let hasStatus = status.map { !$0.summary.isEmpty } ?? false
             drawDenseWindow(
                 label: snapshot.primaryLabel,
                 window: snapshot.primary,
@@ -3326,7 +3679,7 @@ final class ProviderUsageView: NSView {
                 drawDenseWindow(
                     label: secondaryLabel,
                     window: snapshot.secondary,
-                    y: 3,
+                    y: hasStatus ? 8 : 3,
                     labelX: 31,
                     barX: snapshot.provider == .cursor ? 65 : 58,
                     barWidth: snapshot.provider == .cursor ? 67 : 74,
@@ -3334,6 +3687,7 @@ final class ProviderUsageView: NSView {
                     fontSize: 8.5
                 )
             }
+            if hasStatus { drawStatusLine(y: 0.5, fontSize: 7) }
         case .collapsed:
             drawCollapsed()
         case .expanded:
@@ -3341,14 +3695,16 @@ final class ProviderUsageView: NSView {
         case .single:
             drawSingle()
         case .regular:
+            let hasStatus = status.map { !$0.summary.isEmpty } ?? false
             if let secondaryLabel = snapshot.secondaryLabel {
                 let column = windowLabelColumnWidth(snapshot.primaryLabel, secondaryLabel)
-                drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: 15, labelColumnWidth: column)
-                drawWindow(label: secondaryLabel, window: snapshot.secondary, y: 3, labelColumnWidth: column)
+                drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: hasStatus ? 17 : 15, labelColumnWidth: column)
+                drawWindow(label: secondaryLabel, window: snapshot.secondary, y: hasStatus ? 9.5 : 3, labelColumnWidth: column)
             } else {
                 let column = windowLabelColumnWidth(snapshot.primaryLabel)
-                drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: 9, labelColumnWidth: column)
+                drawWindow(label: snapshot.primaryLabel, window: snapshot.primary, y: hasStatus ? 11 : 9, labelColumnWidth: column)
             }
+            if hasStatus { drawStatusLine(y: 1.5) }
         }
     }
 
@@ -3501,6 +3857,40 @@ final class ProviderUsageView: NSView {
         (value as NSString).draw(at: NSPoint(x: 30, y: 4), withAttributes: percentAttrs)
     }
 
+    // MARK: Agent status drawing
+
+    private func statusColor(_ state: AgentState) -> NSColor {
+        switch state {
+        case .working: return .systemGreen
+        case .waiting: return .systemOrange
+        case .idle, .unknown: return .tertiaryLabelColor
+        }
+    }
+
+    /// Compact/collapsed cards: a 5px state dot in the top-right corner so the
+    /// run state is visible even on the narrowest cards.
+    private func drawStatusDot() {
+        guard let status else { return }
+        statusColor(status.state).setFill()
+        NSBezierPath(
+            ovalIn: NSRect(x: bounds.width - 9, y: bounds.height - 10, width: 5, height: 5)
+        ).fill()
+    }
+
+    /// Medium/regular cards: a single small status line under the windows.
+    /// Summary is truncated to the card width so it can never overlap the
+    /// right-aligned percent/reset columns.
+    private func drawStatusLine(y: CGFloat, fontSize: CGFloat = 7) {
+        guard let status, !status.summary.isEmpty else { return }
+        let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+        let maxWidth = max(20, bounds.width - 12)
+        let text = Self.truncate(status.summary, font: font, maxWidth: maxWidth)
+        (text as NSString).draw(at: NSPoint(x: 30, y: y), withAttributes: [
+            .font: font,
+            .foregroundColor: statusColor(status.state)
+        ])
+    }
+
     private func drawDenseWindow(
         label: String,
         window: LimitWindow?,
@@ -3637,7 +4027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let store = UsageStore(collectors: [
             CodexAppServerCollector(),
             ClaudeUsageCollector(),
-            GeminiUsageCollector(),
+            // GeminiUsageCollector(), // disabled: reads Chrome "Safe Storage" keychain key every refresh -> repeated security-alert prompts; Gemini not used
             CursorUsageCollector(),
             AntigravityUsageCollector(),
             OpenRouterUsageCollector(),
@@ -3767,6 +4157,63 @@ if let index = CommandLine.arguments.firstIndex(of: "--render-cards") {
         renderSampleCards(to: directory)
     }
     exit(0)
+}
+
+/// Diagnostic escape hatch: run one collector outside the UI and dump its raw
+/// snapshot — usage: `tokenbar --print-usage <codex|claude|workbuddy|cursor|…>`
+/// The `error` field in the JSON is the collector's real failure reason, which
+/// the Touch Bar card only shows truncated.
+if let index = CommandLine.arguments.firstIndex(of: "--print-usage"),
+   CommandLine.arguments.indices.contains(index + 1) {
+    let name = CommandLine.arguments[index + 1].lowercased()
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = SnapshotBox()
+    Task.detached {
+        let snapshot: UsageSnapshot? = switch name {
+        case "codex": await CodexAppServerCollector().collect(force: true)
+        case "claude": await ClaudeUsageCollector().collect(force: true)
+        case "workbuddy": await WorkBuddyUsageCollector().collect(force: true)
+        case "cursor": await CursorUsageCollector().collect(force: true)
+        case "antigravity": await AntigravityUsageCollector().collect(force: true)
+        case "openrouter": await OpenRouterUsageCollector().collect(force: true)
+        default: nil
+        }
+        box.snapshot = snapshot
+        semaphore.signal()
+    }
+    guard semaphore.wait(timeout: .now() + 25) == .success else {
+        FileHandle.standardError.write(Data("\(name) usage diagnostic timed out\n".utf8))
+        exit(124)
+    }
+    if let snapshot = box.snapshot {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(snapshot),
+           let json = String(data: data, encoding: .utf8) {
+            print(json)
+        }
+    } else {
+        FileHandle.standardError.write(
+            Data("unknown provider '\(name)'. Try: codex claude workbuddy cursor antigravity openrouter\n".utf8)
+        )
+    }
+    // Run status is a completely separate pipeline from usage (hook state files
+    // / session heartbeats vs quota APIs), so a card can show correct credits
+    // and a wrong state. Print both or debugging one tells you nothing.
+    MainActor.assumeIsolated {
+        guard let provider = Provider.allCases.first(where: { $0.rawValue.lowercased() == name }) else { return }
+        let status = AgentStatusMonitor.shared.status(for: provider)
+        print("--- agent status ---")
+        print("state:   \(status.state.rawValue)")
+        print("project: \(status.project ?? "-")")
+        print("summary: \(status.summary)")
+        if let updatedAt = status.updatedAt {
+            print("updated: \(updatedAt) (\(Int(-updatedAt.timeIntervalSinceNow))s ago)")
+        } else {
+            print("updated: -")
+        }
+    }
+    exit(box.snapshot?.error == nil ? 0 : 1)
 }
 
 if CommandLine.arguments.contains("--print-gemini-usage") {
