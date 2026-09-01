@@ -2570,50 +2570,126 @@ final class AgentStatusMonitor {
         }
     }
 
-    /// Desktop Codex (ChatGPT.app) liveness heuristic. The app-server keeps a
-    /// per-thread row in ~/.codex/state_5.sqlite whose `updated_at_ms` is
-    /// bumped every time the user submits a turn — a natural heartbeat, no
-    /// hooks involved. The freshest non-archived thread is the session the
-    /// user is looking at; its `cwd` is the project the card should show.
-    /// Uses sqlite3 -readonly so we never contend with the app-server's own
-    /// writes, and returns .unknown when the database is missing/unreadable
-    /// so the caller can fall back to the hook state file.
+    /// Desktop Codex (ChatGPT.app) liveness heuristic, two signals:
+    ///
+    /// 1. **Log stream (primary, ~seconds).** The app-server writes one
+    ///    `item/agentMessage/delta` row per streamed model delta — dozens per
+    ///    second while generating — plus `run_sampling_request` when a turn
+    ///    starts (covers the thinking phase, which emits no deltas). Any of
+    ///    those in the last 120s means a turn is live; the count drops to zero
+    ///    right after the last delta, so the card flips to idle ~2 minutes
+    ///    after a task ends instead of waiting on the thread store alone.
+    /// 2. **Thread store (fallback).** `threads.updated_at_ms` only bumps on
+    ///    turn submit/end, so alone it lags by a full window. It covers the
+    ///    gap if the log schema changes.
+    ///
+    /// Both database file names carry a schema version (`logs_2`, `state_5`)
+    /// that the desktop app bumps on major upgrades, so we glob for the newest
+    /// `logs_*.sqlite` / `state_*.sqlite` instead of hardcoding the digit.
+    /// Uses sqlite3 -readonly so we never contend with the app-server's writes.
+    /// Returns .unknown when neither database is usable so the caller can fall
+    /// back to the hook state file.
     private func codexDesktopStatus() -> AgentStatus {
-        let db = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/state_5.sqlite").path
+        let codexDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex")
+        let logsDB = newestCodexDB(in: codexDir, prefix: "logs_")
+        let stateDB = newestCodexDB(in: codexDir, prefix: "state_")
+
+        var project: String?
+        if let stateDB, let (cwd, _) = codexLatestThread(in: stateDB) {
+            project = URL(fileURLWithPath: cwd).lastPathComponent
+        }
+
+        if let logsDB {
+            // The log stream is authoritative while it exists. A marker within
+            // the window means a turn is live; 90s covers the thinking phase
+            // (run_sampling_request is written the moment a turn is submitted,
+            // before any deltas flow) and still flips to idle ~90s after the
+            // last delta. The thread store is NOT consulted for the
+            // working/idle decision here — its stamp stays fresh after a turn
+            // ends, which would otherwise stretch the idle delay back out.
+            let last = codexLastActivity(in: logsDB, window: 90)
+            guard let last else {
+                return AgentStatus(
+                    state: .idle,
+                    project: project,
+                    summary: project.map { "空闲 · \($0)" } ?? "空闲",
+                    updatedAt: nil
+                )
+            }
+            return AgentStatus(
+                state: .working,
+                project: project,
+                summary: project.map { "干活中 · \($0)" } ?? "干活中",
+                updatedAt: last
+            )
+        }
+
+        // No log DB (schema rename, deleted, CLI-only install): fall back to the
+        // turn stamp with a wider margin.
+        if let stateDB, let (_, updated) = codexLatestThread(in: stateDB), let updated {
+            let working = Date().timeIntervalSince(updated) <= 180
+            let summary = project.map { working ? "干活中 · \($0)" : "空闲 · \($0)" } ?? (working ? "干活中" : "空闲")
+            return AgentStatus(
+                state: working ? .working : .idle,
+                project: project,
+                summary: summary,
+                updatedAt: working ? updated : nil
+            )
+        }
+
+        return AgentStatus(state: .unknown, project: nil, summary: "", updatedAt: nil)
+    }
+
+    /// Newest `prefix*.sqlite` under `dir` by modification time, or nil.
+    /// The version digit in the Codex database names is not stable across app
+    /// upgrades, so never address them literally.
+    private func newestCodexDB(in dir: URL, prefix: String) -> String? {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        ) else { return nil }
+        let matches = files.filter {
+            $0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension == "sqlite"
+        }
+        guard let best = matches.max(by: {
+            let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? .distantPast
+            let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? .distantPast
+            return a < b
+        }) else { return nil }
+        return best.path
+    }
+
+    /// Timestamp of the most recent "turn is running" log row in the last
+    /// `window` seconds, or nil. Matches delta (streamed output), sampling
+    /// start (turn submitted) and completed (turn finished) markers.
+    private func codexLastActivity(in db: String, window: TimeInterval) -> Date? {
+        let since = Int(Date().timeIntervalSince1970 - window)
         let out = capture(
             "/usr/bin/sqlite3",
-            ["-readonly", "-noheader", "-separator", "|",
-             db,
+            ["-readonly", db,
+             "SELECT max(ts) FROM logs WHERE ts >= \(since) AND (feedback_log_body LIKE '%item/agentMessage/delta%' OR feedback_log_body LIKE '%run_sampling_request%' OR feedback_log_body LIKE '%item/completed%')"]
+        )
+        guard let t = Double(out.trimmingCharacters(in: .whitespacesAndNewlines)),
+              t > 0 else { return nil }
+        return Date(timeIntervalSince1970: t)
+    }
+
+    /// (cwd, updated_at_ms) of the freshest non-archived thread, or nil.
+    private func codexLatestThread(in db: String) -> (cwd: String, updated: Date?)? {
+        let out = capture(
+            "/usr/bin/sqlite3",
+            ["-readonly", "-noheader", "-separator", "|", db,
              "SELECT cwd, updated_at_ms FROM threads WHERE archived=0 ORDER BY updated_at_ms DESC LIMIT 1"]
         )
-        // One line: "/Users/gchyang/Documents/Codex/2026-09-01/qing|1788230130"
-        guard let line = out.split(separator: "\n").first else {
-            return AgentStatus(state: .unknown, project: nil, summary: "", updatedAt: nil)
-        }
+        guard let line = out.split(separator: "\n").first else { return nil }
         let parts = line.split(separator: "|", maxSplits: 1)
         guard parts.count == 2,
               let updatedMs = Double(parts[1]),
-              updatedMs > 0 else {
-            return AgentStatus(state: .unknown, project: nil, summary: "", updatedAt: nil)
-        }
-        let updated = Date(timeIntervalSince1970: updatedMs / 1000)
-        let age = Date().timeIntervalSince(updated)
-        let project = parts[0].isEmpty ? nil : URL(fileURLWithPath: String(parts[0])).lastPathComponent
-        // Same contract as the WorkBuddy heartbeat channel: a turn within the
-        // window is "working", anything older is idle. 180s matches the
-        // working-expiry in hookStatus(): a finished turn stops bumping
-        // updated_at_ms (verified — desktop Codex only writes it on turn
-        // submit/end, not during generation), so 360s made the card hang on
-        // "干活中" for up to six minutes after a short task ended.
-        let idle = age > 180
-        let summary = project.map { idle ? "空闲 · \($0)" : "干活中 · \($0)" } ?? (idle ? "空闲" : "干活中")
-        return AgentStatus(
-            state: idle ? .idle : .working,
-            project: project,
-            summary: summary,
-            updatedAt: idle ? nil : updated
-        )
+              updatedMs > 0 else { return nil }
+        return (String(parts[0]), Date(timeIntervalSince1970: updatedMs / 1000))
     }
 
     private func hookStatus(provider: Provider) -> AgentStatus {
@@ -2663,10 +2739,36 @@ final class AgentStatusMonitor {
             return AgentStatus(state: .idle, project: nil, summary: "未运行", updatedAt: nil)
         }
         // WorkBuddy has no hook API (its CLI only supports in-process SDK hooks,
-        // not shell commands), so fall back to session heartbeats.
+        // not shell commands). The Electron app's per-session logs under
+        // ~/.workbuddy/logs/<date>/ are the real-time signal: while a turn is
+        // streaming, the CLI writes `ModelProvider Stream progress` every ~10s,
+        // plus `First raw chunk received` / `First meaningful token received` /
+        // `Stream idle monitor armed` when the turn starts. A `WorkflowMemProbe
+        // tick` row also fires every 10s while idle, so match only the
+        // ModelProvider markers. Fall back to the session heartbeats when no
+        // session log exists (fresh install, log dir moved).
+        if let log = newestWorkBuddyLog() {
+            let last = workBuddyLastActivity(in: log, window: 90)
+            let project = workBuddyProject(from: log)
+            if let last {
+                return AgentStatus(
+                    state: .working,
+                    project: project,
+                    summary: project.map { "干活中 · \($0)" } ?? "干活中",
+                    updatedAt: last
+                )
+            }
+            return AgentStatus(
+                state: .idle,
+                project: project,
+                summary: project.map { "空闲 · \($0)" } ?? "空闲",
+                updatedAt: nil
+            )
+        }
+        // No session log: fall back to heartbeat files with a tighter window
+        // than before (180s, matching the Codex thread-store fallback).
         let (project, lastActivity) = workBuddyLiveSession()
-        // ~2 heartbeat periods, so the card doesn't flip while one is in flight.
-        let idle = lastActivity.map { Date().timeIntervalSince($0) > 360 } ?? true
+        let idle = lastActivity.map { Date().timeIntervalSince($0) > 180 } ?? true
         let summary: String
         if let project {
             summary = idle ? "空闲 · \(project)" : "干活中 · \(project)"
@@ -2681,10 +2783,104 @@ final class AgentStatusMonitor {
         )
     }
 
-    /// WorkBuddy liveness heuristic. The Electron support dir under ~/Library
-    /// almost never writes (the old mtime scan there read "idle" almost always);
-    /// what does move is ~/.workbuddy/sessions/*.json, whose `lastHeartbeat`
-    /// refreshes while a session is alive.
+    /// Newest real-project session log under ~/.workbuddy/logs/<date>/, or nil.
+    /// WorkBuddy writes one `<workspace>__<sessionId>.log` per project session,
+    /// rolled into a per-day directory; the file keeps growing while the
+    /// session is alive, so mtime picks the currently active project. Session
+    /// IDs survive across days, and the host CLI / system logs are excluded by
+    /// their `__`-prefixed, `unknown-workspace__`, `workbuddyMainThread__`,
+    /// `daemon-` etc. names.
+    private func newestWorkBuddyLog() -> String? {
+        let logsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".workbuddy/logs")
+        guard let dayDirs = try? FileManager.default.contentsOfDirectory(
+            at: logsDir,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        ) else { return nil }
+        var best: (date: Date, path: String)?
+        for day in dayDirs where day.hasDirectoryPath {
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: day,
+                includingPropertiesForKeys: [.contentModificationDateKey]
+            ) else { continue }
+            for f in files where f.pathExtension == "log" {
+                let name = f.lastPathComponent
+                guard name.contains("__"),
+                      !name.hasPrefix("__"),
+                      !name.hasPrefix("unknown-workspace"),
+                      !name.hasPrefix("workbuddyMainThread"),
+                      !name.hasPrefix("daemon-"),
+                      !name.hasPrefix("edge-sync"),
+                      !name.hasPrefix("extension-scheduler-") else {
+                    continue
+                }
+                let mtime = (try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                    ?? .distantPast
+                if best == nil || mtime > best!.date {
+                    best = (mtime, f.path)
+                }
+            }
+        }
+        return best?.path
+    }
+
+    /// Workspace name embedded in a session log file name:
+    /// `2026-08-31-18-44-46__4d91742a….log` → `2026-08-31-18-44-46`.
+    private func workBuddyProject(from logPath: String) -> String? {
+        let name = URL(fileURLWithPath: logPath).lastPathComponent
+        guard let range = name.range(of: "__") else { return nil }
+        return String(name[..<range.lowerBound])
+    }
+
+    /// Timestamp of the most recent ModelProvider activity in the last
+    /// `window` seconds of a session log, or nil. Reads only the tail of the
+    /// file (logs can reach 100+ MB) and matches the streaming markers, never
+    /// the periodic `WorkflowMemProbe tick` noise.
+    private func workBuddyLastActivity(in logPath: String, window: TimeInterval) -> Date? {
+        guard let handle = FileHandle(forReadingAtPath: logPath) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        guard size > 0 else { return nil }
+        let tailBytes = min(size, 12_000_000)
+        try? handle.seek(toOffset: size - tailBytes)
+        guard let data = try? handle.read(upToCount: Int(tailBytes)),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+
+        let markers = ["Stream progress", "First raw chunk received",
+                       "First meaningful token received", "Stream idle monitor armed"]
+        let tsRegex = try? NSRegularExpression(
+            pattern: #"\[(\d{1,2}/\d{1,2}/\d{4}, \d{1,2}:\d{2}:\d{2} [AP]M)"#
+        )
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "M/d/yyyy, h:mm:ss a"
+        fmt.timeZone = .current
+
+        let now = Date()
+        var latest: Date?
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let s = String(line)
+            guard markers.contains(where: { s.contains($0) }) else { continue }
+            guard let tsRegex, let match = tsRegex.firstMatch(
+                in: s,
+                range: NSRange(s.startIndex..., in: s)
+            ), match.numberOfRanges > 1,
+                let r = Range(match.range(at: 1), in: s),
+                let d = fmt.date(from: String(s[r])),
+                now.timeIntervalSince(d) <= window else { continue }
+            if latest == nil || d > latest! { latest = d }
+        }
+        return latest
+    }
+
+    /// WorkBuddy liveness heuristic (fallback only — the session-log stream in
+    /// `workbuddyStatus()` is authoritative while it exists). The Electron
+    /// support dir under ~/Library almost never writes (the old mtime scan
+    /// there read "idle" almost always); what does move is
+    /// ~/.workbuddy/sessions/*.json, whose `lastHeartbeat` refreshes while a
+    /// session is alive. Note: newer WorkBuddy versions stopped heartbeating
+    /// project sessions (only the host CLI session stays fresh), which is why
+    /// this is no longer the primary signal.
     ///
     /// Only *real project* sessions count: the host CLI session lives under
     /// /var/folders and stays fresh as long as the app is open (which made the
