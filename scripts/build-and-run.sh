@@ -54,5 +54,29 @@ cat > "$PLIST" <<PLIST_EOF
 </plist>
 PLIST_EOF
 
-launchctl load "$PLIST" || launchctl bootstrap gui/"$UID" "$PLIST" || true
-echo "Installed and launched: $INSTALLED_APP"
+# Register with launchd. In shells that aren't children of the user's GUI
+# session (e.g. an agent sandbox), launchctl is unreliable: `load` can return
+# 0 without the service actually registering, and `bootstrap` fails with
+# "5: Input/output error". So the pgrep check below is the source of truth —
+# if the binary isn't up, fall back to LaunchServices rather than leaving the
+# Touch Bar dead.
+if launchctl load "$PLIST" 2>/dev/null; then
+    echo "launchd: load returned 0 (verify below)"
+elif launchctl bootstrap gui/"$UID" "$PLIST" 2>/dev/null; then
+    echo "launchd: bootstrapped"
+else
+    echo "launchd unavailable (non-GUI shell?)"
+fi
+
+sleep 1
+if ! pgrep -f "$INSTALLED_APP/Contents/MacOS/tokenbar" >/dev/null 2>&1; then
+    echo "launchd did not bring the app up — starting via LaunchServices"
+    open "$INSTALLED_APP"
+    sleep 1
+fi
+if pgrep -f "$INSTALLED_APP/Contents/MacOS/tokenbar" >/dev/null 2>&1; then
+    echo "Installed and launched: $INSTALLED_APP (pid $(pgrep -f "$INSTALLED_APP/Contents/MacOS/tokenbar" | head -1))"
+else
+    echo "ERROR: tokenbar did not come up — inspect $INSTALLED_APP and $PLIST" >&2
+    exit 1
+fi
