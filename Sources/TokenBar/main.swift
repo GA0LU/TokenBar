@@ -2747,17 +2747,27 @@ final class AgentStatusMonitor {
         // tick` row also fires every 10s while idle, so match only the
         // ModelProvider markers. Fall back to the session heartbeats when no
         // session log exists (fresh install, log dir moved).
-        if let log = newestWorkBuddyLog() {
-            let last = workBuddyLastActivity(in: log, window: 90)
-            let project = workBuddyProject(from: log)
-            if let last {
+        // Global scan, not "newest file by mtime": every live session keeps
+        // touching its log with a 10s idle tick (`WorkflowMemProbe tick`), so
+        // all live logs converge to the same mtime and mtime cannot pick the
+        // session that is actually streaming. Search every live log for
+        // ModelProvider stream markers and take the freshest one — this is what
+        // keeps the card from sticking on 空闲 after wake when a stale session
+        // happens to have the newest mtime.
+        let candidates = workBuddyCandidateLogs(staleWindow: 120)
+        if !candidates.isEmpty {
+            if let activity = workBuddyGlobalActivity(in: 90, candidates: candidates) {
+                let project = workBuddyProject(from: activity.logPath)
                 return AgentStatus(
                     state: .working,
                     project: project,
                     summary: project.map { "干活中 · \($0)" } ?? "干活中",
-                    updatedAt: last
+                    updatedAt: activity.latest
                 )
             }
+            // Idle, but name the freshest session so the card reads
+            // `空闲 · <workspace>` like before.
+            let project = workBuddyProject(from: candidates[0].path)
             return AgentStatus(
                 state: .idle,
                 project: project,
@@ -2783,21 +2793,22 @@ final class AgentStatusMonitor {
         )
     }
 
-    /// Newest real-project session log under ~/.workbuddy/logs/<date>/, or nil.
-    /// WorkBuddy writes one `<workspace>__<sessionId>.log` per project session,
-    /// rolled into a per-day directory; the file keeps growing while the
-    /// session is alive, so mtime picks the currently active project. Session
-    /// IDs survive across days, and the host CLI / system logs are excluded by
-    /// their `__`-prefixed, `unknown-workspace__`, `workbuddyMainThread__`,
-    /// `daemon-` etc. names.
-    private func newestWorkBuddyLog() -> String? {
+    /// Real project session logs under ~/.workbuddy/logs/<date>/ touched within
+    /// the last `staleWindow` seconds, newest mtime first. WorkBuddy writes one
+    /// `<workspace>__<sessionId>.log` per project session, rolled into a
+    /// per-day directory; the host CLI / system logs are excluded by their
+    /// `__`-prefixed, `unknown-workspace__`, `workbuddyMainThread__`,
+    /// `daemon-` etc. names. The mtime window keeps dead sessions (no idle
+    /// tick, no stream — nothing written for a while) from being scanned.
+    private func workBuddyCandidateLogs(staleWindow: TimeInterval) -> [(path: String, mtime: Date)] {
         let logsDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".workbuddy/logs")
         guard let dayDirs = try? FileManager.default.contentsOfDirectory(
             at: logsDir,
             includingPropertiesForKeys: [.contentModificationDateKey]
-        ) else { return nil }
-        var best: (date: Date, path: String)?
+        ) else { return [] }
+        let cutoff = Date().addingTimeInterval(-staleWindow)
+        var out: [(path: String, mtime: Date)] = []
         for day in dayDirs where day.hasDirectoryPath {
             guard let files = try? FileManager.default.contentsOfDirectory(
                 at: day,
@@ -2816,12 +2827,33 @@ final class AgentStatusMonitor {
                 }
                 let mtime = (try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
                     ?? .distantPast
-                if best == nil || mtime > best!.date {
-                    best = (mtime, f.path)
-                }
+                guard mtime > cutoff else { continue }
+                out.append((f.path, mtime))
             }
         }
-        return best?.path
+        return out.sorted { $0.mtime > $1.mtime }
+    }
+
+    /// Most recent ModelProvider stream activity across *all* candidate
+    /// session logs within the last `window` seconds, or nil — returning the
+    /// freshest activity and the session it came from so the project name and
+    /// the working/idle decision always agree on one session. Only the
+    /// ModelProvider markers are real "working" signals; the periodic
+    /// `WorkflowMemProbe tick` noise is never matched.
+    private func workBuddyGlobalActivity(
+        in window: TimeInterval,
+        candidates: [(path: String, mtime: Date)]
+    ) -> (latest: Date, logPath: String)? {
+        var best: (latest: Date, logPath: String)?
+        for candidate in candidates {
+            guard let latest = workBuddyLastActivity(in: candidate.path, window: window) else {
+                continue
+            }
+            if best == nil || latest > best!.latest {
+                best = (latest, candidate.path)
+            }
+        }
+        return best
     }
 
     /// Workspace name embedded in a session log file name:
@@ -3122,9 +3154,15 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         // After sleep the periodic timer may not fire promptly, so pull fresh
         // data immediately and bypass each collector's throttle.
         refresh(force: true)
+        // The 10s status timer can stall across sleep (missed fire dates are
+        // coalesced); re-evaluate the agent cards right away so a session that
+        // resumed streaming on wake flips from 空闲 back to 干活中 without
+        // waiting for the next tick.
+        refreshStatusViews()
         // macOS dismisses the system-modal Touch Bar on wake; bring it back once
-        // the display has settled.
+        // the display has settled, with one more fresh status pass.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.refreshStatusViews()
             self?.showTouchBar()
         }
     }
