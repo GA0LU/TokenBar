@@ -872,6 +872,26 @@ actor ClaudeUsageCollector: UsageCollecting {
     nonisolated let provider: Provider = .claude
 
     private static let keychainService = "Claude Code-credentials"
+    /// TokenBar's own store for a long-lived token from `claude setup-token`.
+    /// Unlike the CLI's OAuth blob these do not rotate, so they cannot be
+    /// invalidated by a lost write-back — the failure mode that repeatedly
+    /// broke the rotating chain. Also lets TokenBar work when the only Claude
+    /// login lives in the desktop app, whose encrypted store we cannot read.
+    static let tokenKeychainService = "TokenBar.ClaudeToken"
+    static let tokenKeychainAccount = "default"
+
+    /// A non-rotating token, if the user configured one.
+    private static func longLivedToken() -> String? {
+        if let stored = SecretStore.read(service: tokenKeychainService, account: tokenKeychainAccount),
+           !stored.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let env = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"],
+           !env.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return env.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
     /// Public OAuth client ID for Claude Code — the same value ships in every
     /// `claude` CLI binary, so it is an identifier, not a secret. An env var can
     /// override it, but we must have a working default: the app runs from a
@@ -964,9 +984,13 @@ actor ClaudeUsageCollector: UsageCollecting {
             // A revoked refresh token can only be fixed by re-login; retrying
             // sooner is pointless, so go straight to the longest backoff.
             let backoff: Double
-            if case CollectorError.loginRequired = error {
+            switch error {
+            // None of these can be fixed by retrying sooner — they need the
+            // user to supply a new token.
+            case CollectorError.loginRequired, CollectorError.noCredentials,
+                 CollectorError.tokenRejected:
                 backoff = 1800
-            } else {
+            default:
                 backoff = min(Self.pollInterval * pow(2, Double(consecutiveFailures - 1)), 1800)
             }
             nextFetchAt = now.addingTimeInterval(backoff)
@@ -996,6 +1020,24 @@ actor ClaudeUsageCollector: UsageCollecting {
         let stored = (try? loadKeychainObject()) ?? [:]
         let keychainCredentials = try? credentials(from: stored)
 
+        // A long-lived token needs no refresh at all, so prefer it: the rotating
+        // chain is what kept breaking, and it is also the only option when the
+        // user's Claude login lives solely in the desktop app.
+        if let token = Self.longLivedToken() {
+            let plan = (stored["claudeAiOauth"] as? [String: Any] ?? stored)["subscriptionType"] as? String
+            let longLived = Credentials(
+                accessToken: token,
+                refreshToken: "",
+                expiresAt: .distantFuture,
+                subscriptionType: plan
+            )
+            do {
+                return try await fetchUsage(longLived)
+            } catch CollectorError.unauthorized {
+                throw CollectorError.tokenRejected
+            }
+        }
+
         // Use whichever tokens are freshest. The keychain may have been rotated
         // by the claude CLI (use theirs, or refreshing with our stale copy trips
         // the server's reuse detection and revokes the whole token family), or
@@ -1010,7 +1052,7 @@ actor ClaudeUsageCollector: UsageCollecting {
         case let (nil, keychain?):
             credentials = keychain
         case (nil, nil):
-            throw CollectorError.message("Claude credentials not found; run `claude` to login")
+            throw CollectorError.noCredentials
         }
 
         // A previous rotation may not have reached the keychain; keep retrying
@@ -1128,7 +1170,7 @@ actor ClaudeUsageCollector: UsageCollecting {
             let data = output.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            throw CollectorError.message("Claude credentials not found; run `claude` to login")
+            throw CollectorError.noCredentials
         }
         return object
     }
@@ -2448,12 +2490,20 @@ enum CollectorError: LocalizedError {
     case message(String)
     case unauthorized
     case loginRequired
+    case noCredentials
+    case tokenRejected
 
     var errorDescription: String? {
         switch self {
         case .message(let message): message
-        case .unauthorized: "Claude token rejected; run `claude` to re-login"
-        case .loginRequired: "Claude login expired — run `claude` in Terminal to re-login"
+        case .unauthorized: "Claude token rejected"
+        // These point at the menu rather than telling the user to "log in":
+        // being signed into the Claude desktop app does not populate the CLI
+        // credentials TokenBar can read, so "run `claude` to login" was
+        // misleading for anyone whose only login lives in the desktop app.
+        case .loginRequired: "Token expired — see menu ▸ Claude Token"
+        case .noCredentials: "No token — see menu ▸ Claude Token"
+        case .tokenRejected: "Token rejected — see menu ▸ Claude Token"
         }
     }
 }
@@ -2681,6 +2731,19 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             }
             menu.addItem(item)
         }
+
+        menu.addItem(.separator())
+        let claudeToken = NSMenuItem(title: "Claude Token...", action: #selector(configureClaudeToken), keyEquivalent: "")
+        claudeToken.target = self
+        menu.addItem(claudeToken)
+
+        let clearClaudeToken = NSMenuItem(title: "Clear Claude Token", action: #selector(clearClaudeToken), keyEquivalent: "")
+        clearClaudeToken.target = self
+        clearClaudeToken.isEnabled = SecretStore.read(
+            service: ClaudeUsageCollector.tokenKeychainService,
+            account: ClaudeUsageCollector.tokenKeychainAccount
+        ) != nil
+        menu.addItem(clearClaudeToken)
 
         menu.addItem(.separator())
         let openRouterKey = NSMenuItem(title: "OpenRouter API Key...", action: #selector(configureOpenRouterKey), keyEquivalent: "")
@@ -3111,6 +3174,52 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             card.layer?.zPosition = 0
             card.layer?.transform = CATransform3DIdentity
         }
+    }
+
+    @objc private func configureClaudeToken() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Claude Token"
+        alert.informativeText = """
+        Run `claude setup-token` in Terminal and paste the token below.
+
+        This token does not rotate, so it keeps working even when the Claude         CLI credentials are refreshed elsewhere. Signing into the Claude         desktop app alone is not enough: its credentials are stored encrypted         and cannot be read from here.
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        input.placeholderString = "sk-ant-oat01-..."
+        if SecretStore.read(
+            service: ClaudeUsageCollector.tokenKeychainService,
+            account: ClaudeUsageCollector.tokenKeychainAccount
+        ) != nil {
+            input.placeholderString = "Saved. Paste a new token to replace it."
+        }
+        alert.accessoryView = input
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let token = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        do {
+            try SecretStore.write(
+                service: ClaudeUsageCollector.tokenKeychainService,
+                account: ClaudeUsageCollector.tokenKeychainAccount,
+                value: token
+            )
+            refresh(force: true)
+        } catch {
+            showError(message: error.localizedDescription)
+        }
+    }
+
+    @objc private func clearClaudeToken() {
+        SecretStore.delete(
+            service: ClaudeUsageCollector.tokenKeychainService,
+            account: ClaudeUsageCollector.tokenKeychainAccount
+        )
+        refresh(force: true)
     }
 
     @objc private func configureOpenRouterKey() {
