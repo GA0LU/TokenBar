@@ -50,6 +50,17 @@ enum Provider: String, CaseIterable, Codable, Sendable {
         }
     }
 
+    /// Shown on cards and menus. `rawValue` stays the persisted key, so renaming
+    /// a provider here never invalidates saved visibility or ordering.
+    var displayName: String {
+        switch self {
+        // Cursor's allowance is now the shared X Subscription pool covering both
+        // Cursor and Grok, so the card no longer represents Cursor alone.
+        case .cursor: "Cursor + Grok"
+        default: rawValue
+        }
+    }
+
     var primaryWindowLabel: String {
         switch self {
         // Codex labels come from the server-reported window duration; these are
@@ -57,7 +68,7 @@ enum Provider: String, CaseIterable, Codable, Sendable {
         case .codex: "5h"
         case .claude: "5h"
         case .gemini: "5h"
-        case .cursor: "All"
+        case .cursor: "Wk"
         case .antigravity: "5h"
         case .openrouter: "Spent"
         case .workbuddy: ""
@@ -69,7 +80,7 @@ enum Provider: String, CaseIterable, Codable, Sendable {
         case .codex: "Wk"
         case .claude: "Wk"
         case .gemini: "Wk"
-        case .cursor: "API"
+        case .cursor: nil
         case .antigravity: "Wk"
         case .openrouter, .workbuddy: nil
         }
@@ -1802,6 +1813,19 @@ actor CursorUsageCollector: UsageCollecting {
         return token
     }
 
+    /// The shared allowance refreshes weekly while billing stays monthly, and
+    /// the API reports only the billing cycle. Derive the weekly boundary by
+    /// stepping 7-day periods from the cycle start, never past the cycle end.
+    private static func weeklyReset(cycleStart: Date?, cycleEnd: Date?) -> Date? {
+        guard let cycleStart else { return nil }
+        let week: TimeInterval = 7 * 24 * 3600
+        let elapsed = Date().timeIntervalSince(cycleStart)
+        guard elapsed >= 0 else { return cycleStart }
+        let next = cycleStart.addingTimeInterval((floor(elapsed / week) + 1) * week)
+        if let cycleEnd, next > cycleEnd { return cycleEnd }
+        return next
+    }
+
     /// Reads the modern dashboard usage summary. Returns nil (so the caller can
     /// fall back to the legacy endpoint) when the response lacks plan usage.
     private func loadUsageSummary(cookie: String) async throws -> UsageSnapshot? {
@@ -1817,27 +1841,27 @@ actor CursorUsageCollector: UsageCollecting {
             return nil
         }
 
-        // The percentage fields are unit-agnostic (work for both dollar- and
-        // request-based allowances), so we render those directly. The dashboard
-        // headline is the *combined* included usage (`totalPercentUsed`); the
-        // auto-model figure is nearly always ~0% and misleading as a headline,
-        // so we surface combined usage as primary and the named-model/API usage
-        // as secondary — matching cursor.com's two summary lines.
+        // Under the X Subscription, Cursor and Grok draw on one shared allowance
+        // instead of separate Auto/API pools, so the single combined figure
+        // (`totalPercentUsed`) is the whole story; the old two-line Auto + API
+        // split no longer corresponds to anything the user is billed against.
+        // The percentage fields stay unit-agnostic (dollar- and request-based
+        // allowances alike), so we render them directly.
         let totalUsed = Self.clampPercent(
             Self.number(plan["totalPercentUsed"]) ?? Self.number(plan["autoPercentUsed"]) ?? 0
         )
-        let apiUsed = Self.clampPercent(Self.number(plan["apiPercentUsed"]) ?? 0)
-        let autoUsed = Self.clampPercent(Self.number(plan["autoPercentUsed"]) ?? 0)
-        let resetAt = UsageFormat.parseDate(object["billingCycleEnd"] as? String)
-        let plan_ = (object["membershipType"] as? String)?.uppercased() ?? "MONTH"
+        let cycleEnd = UsageFormat.parseDate(object["billingCycleEnd"] as? String)
+        let resetAt = Self.weeklyReset(
+            cycleStart: UsageFormat.parseDate(object["billingCycleStart"] as? String),
+            cycleEnd: cycleEnd
+        ) ?? cycleEnd
+        let plan_ = (object["membershipType"] as? String)?.uppercased() ?? "WEEK"
 
-        // Combined ("All") is the headline for small/collapsed states; the
-        // expanded card drills into the Auto + API breakdown (tertiary = Auto).
         return UsageSnapshot(
             provider: .cursor,
             primary: LimitWindow(usedPercent: totalUsed, resetAt: resetAt),
-            secondary: LimitWindow(usedPercent: apiUsed, resetAt: resetAt),
-            tertiary: LimitWindow(usedPercent: autoUsed, resetAt: resetAt),
+            secondary: nil,
+            tertiary: nil,
             plan: plan_,
             updatedAt: Date(),
             error: nil
@@ -1879,11 +1903,13 @@ actor CursorUsageCollector: UsageCollecting {
             resetAt = Calendar.current.date(byAdding: .month, value: 1, to: start)
         }
 
+        // Legacy fallback: report one window too, matching the unified
+        // allowance the modern endpoint returns.
         return UsageSnapshot(
             provider: .cursor,
-            primary: LimitWindow(usedPercent: requestPercent, resetAt: resetAt),
-            secondary: LimitWindow(usedPercent: advancedPercent, resetAt: resetAt),
-            plan: "MONTH",
+            primary: LimitWindow(usedPercent: max(requestPercent, advancedPercent), resetAt: resetAt),
+            secondary: nil,
+            plan: "WEEK",
             updatedAt: Date(),
             error: nil
         )
@@ -2719,7 +2745,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
         for provider in Provider.allCases {
             let item = NSMenuItem(
-                title: "Show \(provider.rawValue)",
+                title: "Show \(provider.displayName)",
                 action: #selector(toggleProvider(_:)),
                 keyEquivalent: ""
             )
@@ -3500,7 +3526,7 @@ final class ProviderUsageView: NSView {
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
                 .foregroundColor: NSColor.labelColor
             ]
-            (snapshot.provider.rawValue as NSString).draw(at: NSPoint(x: 34, y: 15), withAttributes: titleAttrs)
+            (snapshot.provider.displayName as NSString).draw(at: NSPoint(x: 34, y: 15), withAttributes: titleAttrs)
             ("Spent" as NSString).draw(at: NSPoint(x: 34, y: 4), withAttributes: metaAttrs)
             let valueSize = value.size(withAttributes: valueAttrs)
             value.draw(at: NSPoint(x: bounds.width - 8 - valueSize.width, y: 8), withAttributes: valueAttrs)
@@ -3512,7 +3538,7 @@ final class ProviderUsageView: NSView {
             .font: NSFont.systemFont(ofSize: 9, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ]
-        (snapshot.provider.rawValue as NSString).draw(at: NSPoint(x: 34, y: 10), withAttributes: nameAttrs)
+        (snapshot.provider.displayName as NSString).draw(at: NSPoint(x: 34, y: 10), withAttributes: nameAttrs)
 
         let startX: CGFloat = 94
         let barWidth = max(120, bounds.width - 194)
@@ -3536,7 +3562,7 @@ final class ProviderUsageView: NSView {
             .foregroundColor: NSColor.secondaryLabelColor
         ]
 
-        let name = snapshot.provider.rawValue
+        let name = snapshot.provider.displayName
         let meta = snapshot.plan?.isEmpty == false ? snapshot.plan! : "LIVE"
 
         // The name column grows to fit the longest header line but is capped so the
