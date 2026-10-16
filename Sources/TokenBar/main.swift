@@ -19,7 +19,7 @@ enum Provider: String, CaseIterable, Codable, Sendable {
         case .codex: "CX"
         case .claude: "CL"
         case .gemini: "GM"
-        case .cursor: "CU"
+        case .cursor: "GK"
         case .antigravity: "AG"
         case .openrouter: "OR"
         case .workbuddy: "WB"
@@ -43,7 +43,7 @@ enum Provider: String, CaseIterable, Codable, Sendable {
         case .codex: "/Applications/Codex.app"
         case .claude: "/Applications/Claude.app"
         case .gemini: "/Applications/Gemini.app"
-        case .cursor: "/Applications/Cursor.app"
+        case .cursor: "/Applications/Grok Bot.app"
         case .antigravity: "/Applications/Antigravity.app"
         case .openrouter: "/Applications/OpenRouter.app"
         case .workbuddy: "/Applications/WorkBuddy.app"
@@ -54,9 +54,9 @@ enum Provider: String, CaseIterable, Codable, Sendable {
     /// a provider here never invalidates saved visibility or ordering.
     var displayName: String {
         switch self {
-        // Cursor's allowance is now the shared X Subscription pool covering both
-        // Cursor and Grok, so the card no longer represents Cursor alone.
-        case .cursor: "Cursor + Grok"
+        // The allowance is now the shared X Subscription pool, which Grok and
+        // Cursor both draw on; the card is labelled for the pool, not the editor.
+        case .cursor: "Grok"
         default: rawValue
         }
     }
@@ -175,8 +175,15 @@ enum ProviderIcon {
                   let image = NSImage(contentsOf: url) else { return nil }
             return image
         case .cursor:
-            let path = "/Applications/Cursor.app/Contents/Resources/Cursor.icns"
-            return NSImage(contentsOfFile: path)
+            // Shared X Subscription pool: prefer the Grok Bot icon, falling back
+            // to Cursor's when only the editor is installed.
+            for path in [
+                "/Applications/Grok Bot.app/Contents/Resources/icon.icns",
+                "/Applications/Cursor.app/Contents/Resources/Cursor.icns"
+            ] {
+                if let image = NSImage(contentsOfFile: path) { return image }
+            }
+            return nil
         case .codex, .claude, .antigravity, .openrouter, .workbuddy:
             return nil
         }
