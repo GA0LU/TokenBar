@@ -1115,6 +1115,12 @@ actor ClaudeUsageCollector: UsageCollecting {
         }
         if let error = object["error"] as? [String: Any] {
             let message = error["message"] as? String ?? error["type"] as? String ?? "HTTP \(status)"
+            // A `claude setup-token` long-lived token carries user:inference but
+            // not user:profile, which this endpoint requires, so it can never
+            // read usage. Say so instead of echoing the raw scope error.
+            if message.contains("user:profile") || message.contains("scope") {
+                throw CollectorError.message("Token lacks profile scope — run `claude` to re-login")
+            }
             throw CollectorError.message("Claude usage API: \(message)")
         }
 
