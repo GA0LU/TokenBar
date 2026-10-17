@@ -977,14 +977,11 @@ actor ClaudeUsageCollector: UsageCollecting {
         // bypasses it (wake-from-sleep / manual refresh) for an immediate sync.
         if !force, now < nextFetchAt {
             if let cached { return cached }
-            // In backoff with nothing cached: serve the local estimate (plan
-            // "EST") so the column still shows numbers, and when even that is
-            // unavailable surface the real error (e.g. login required) instead
-            // of a bare "Loading".
-            let message = lastFailureMessage ?? "Loading"
-            return await Task.detached(priority: .utility) {
-                Self.estimatedSnapshot() ?? .failure(.claude, message)
-            }.value
+            // In backoff with nothing cached, report why. We deliberately do not
+            // synthesise a percentage from the local logs: those tokens are
+            // counted differently from the server's own accounting, so the guess
+            // read 100% ("limit reached") against a real 49%.
+            return .failure(.claude, lastFailureMessage ?? "Loading")
         }
         do {
             let snapshot = try await readRealUsage()
@@ -1012,16 +1009,13 @@ actor ClaudeUsageCollector: UsageCollecting {
                 backoff = min(Self.pollInterval * pow(2, Double(consecutiveFailures - 1)), 1800)
             }
             nextFetchAt = now.addingTimeInterval(backoff)
-            // Recent real data beats a local guess; only estimate when the cached
-            // number is too old to trust (or we never had one).
             if let cached, now.timeIntervalSince(cachedAt) < Self.maxCacheAge {
                 return cached
             }
+            // Past that, surface the error rather than a locally derived number.
             let message = error.localizedDescription
             lastFailureMessage = message
-            return await Task.detached(priority: .utility) {
-                Self.estimatedSnapshot() ?? .failure(.claude, message)
-            }.value
+            return .failure(.claude, message)
         }
     }
 
