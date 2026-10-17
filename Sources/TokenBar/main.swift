@@ -54,9 +54,14 @@ enum Provider: String, CaseIterable, Codable, Sendable {
     /// a provider here never invalidates saved visibility or ordering.
     var displayName: String {
         switch self {
-        // The allowance is now the shared X Subscription pool, which Grok and
-        // Cursor both draw on; the card is labelled for the pool, not the editor.
-        case .cursor: "Grok"
+        // One card covers the shared X Subscription pool. Name it for whichever
+        // source actually answers: the pool itself when the Grok CLI is signed
+        // in, otherwise the Cursor summary we fall back to, so a Cursor-only
+        // install is not mislabelled.
+        case .cursor: FileManager.default.fileExists(
+            atPath: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".grok/auth.json").path
+        ) ? "Grok" : "Cursor"
         default: rawValue
         }
     }
