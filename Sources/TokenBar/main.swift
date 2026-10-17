@@ -1766,6 +1766,108 @@ private final class SingleInstanceLock {
 
 /// Reads Cursor usage through the dashboard API, authenticated with the
 /// session token Cursor stores in its local state database.
+/// Minimal protobuf wire-format reader, enough for the one gRPC-Web response we
+/// consume. xAI does not publish the schema, so field numbers come from the
+/// decoded payload: 1 = creditUsagePercent (float), 5 = period end timestamp,
+/// and 8 = currentPeriod, whose field 3 repeats that end timestamp.
+enum ProtobufReader {
+    struct GrokCredits {
+        let usedPercent: Double
+        let resetAt: Date?
+    }
+
+    static func grokCreditsConfig(fromGRPCWeb body: Data) -> GrokCredits? {
+        // gRPC-Web framing: a type byte (0 = data), a big-endian length, then
+        // the message. Trailer frames follow and are ignored.
+        guard body.count > 5, body[body.startIndex] == 0 else { return nil }
+        var length = 0
+        for offset in 1...4 {
+            length = (length << 8) | Int(body[body.startIndex + offset])
+        }
+        let start = body.startIndex + 5
+        guard length > 0, start + length <= body.endIndex else { return nil }
+        let message = body[start..<(start + length)]
+
+        // The response wraps the config in field 1.
+        guard let config = fields(in: message).first(where: { $0.number == 1 })?.data else {
+            return nil
+        }
+        let configFields = fields(in: config)
+
+        guard let percent = configFields.first(where: { $0.number == 1 })?.float else {
+            return nil
+        }
+        let resetAt = configFields.first { $0.number == 5 }?.data
+            .flatMap(timestamp(in:))
+        return GrokCredits(usedPercent: max(0, min(100, Double(percent))), resetAt: resetAt)
+    }
+
+    /// A protobuf Timestamp: field 1 seconds, field 2 nanos (which we ignore).
+    private static func timestamp(in message: Data) -> Date? {
+        guard let seconds = fields(in: message).first(where: { $0.number == 1 })?.varint else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: Double(seconds))
+    }
+
+    private struct Field {
+        let number: Int
+        var varint: UInt64?
+        var float: Float?
+        var data: Data?
+    }
+
+    private static func fields(in message: Data) -> [Field] {
+        var result: [Field] = []
+        var index = message.startIndex
+        while index < message.endIndex {
+            guard let (key, afterKey) = varint(message, index) else { break }
+            index = afterKey
+            let number = Int(key >> 3)
+            switch key & 7 {
+            case 0:
+                guard let (value, next) = varint(message, index) else { return result }
+                index = next
+                result.append(Field(number: number, varint: value))
+            case 1:
+                guard index + 8 <= message.endIndex else { return result }
+                index += 8
+            case 2:
+                guard let (length, next) = varint(message, index) else { return result }
+                let end = next + Int(length)
+                guard end <= message.endIndex else { return result }
+                result.append(Field(number: number, data: message[next..<end]))
+                index = end
+            case 5:
+                guard index + 4 <= message.endIndex else { return result }
+                let bits = message[index..<(index + 4)].reduce(UInt32(0)) { value, byte in
+                    (value >> 8) | (UInt32(byte) << 24)
+                }
+                index += 4
+                result.append(Field(number: number, float: Float(bitPattern: bits)))
+            default:
+                return result
+            }
+        }
+        return result
+    }
+
+    private static func varint(_ data: Data, _ start: Data.Index) -> (UInt64, Data.Index)? {
+        var value: UInt64 = 0
+        var shift: UInt64 = 0
+        var index = start
+        while index < data.endIndex {
+            let byte = data[index]
+            index += 1
+            value |= UInt64(byte & 0x7f) << shift
+            if byte & 0x80 == 0 { return (value, index) }
+            shift += 7
+            if shift > 63 { return nil }
+        }
+        return nil
+    }
+}
+
 actor CursorUsageCollector: UsageCollecting {
     nonisolated let provider: Provider = .cursor
 
@@ -1778,7 +1880,14 @@ actor CursorUsageCollector: UsageCollecting {
             return cached
         }
         do {
-            let snapshot = try await fetchUsage()
+            // Prefer the shared weekly allowance; fall back to Cursor's own
+            // summary when the Grok CLI is not signed in on this machine.
+            let snapshot: UsageSnapshot
+            if let grok = try? await fetchGrokCredits() {
+                snapshot = grok
+            } else {
+                snapshot = try await fetchUsage()
+            }
             cached = snapshot
             cachedAt = now
             return snapshot
@@ -1788,6 +1897,76 @@ actor CursorUsageCollector: UsageCollecting {
             }
             return .failure(.cursor, error.localizedDescription)
         }
+    }
+
+    /// The shared weekly allowance, read from the same gRPC-Web call grok.com
+    /// and the Grok CLI both make. xAI publishes no REST endpoint for it:
+    /// `/rest/rate-limits` reports per-model 2h query limits and
+    /// cursor.com/api/usage-summary reports Cursor-side spend only, so this is
+    /// the one source that matches the figure on grok.com's usage page.
+    private func fetchGrokCredits() async throws -> UsageSnapshot {
+        let token = try Self.grokCLIToken()
+
+        var request = URLRequest(url: URL(string: Self.grokCreditsURL)!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("https://grok.com", forHTTPHeaderField: "Origin")
+        request.setValue("application/grpc-web+proto", forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        request.setValue("1", forHTTPHeaderField: "x-grpc-web")
+        request.setValue("connect-es/2.1.1", forHTTPHeaderField: "x-user-agent")
+        // An empty request message: a gRPC-Web data frame with a zero-length body.
+        request.httpBody = Data([0, 0, 0, 0, 0])
+
+        let (body, response) = try await URLSession.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw CollectorError.message("Grok credits API unavailable")
+        }
+        guard let config = ProtobufReader.grokCreditsConfig(fromGRPCWeb: body) else {
+            throw CollectorError.message("Grok credits response not understood")
+        }
+        return UsageSnapshot(
+            provider: .cursor,
+            primary: LimitWindow(usedPercent: config.usedPercent, resetAt: config.resetAt),
+            secondary: nil,
+            tertiary: nil,
+            plan: nil,
+            updatedAt: Date(),
+            error: nil
+        )
+    }
+
+    private static let grokCreditsURL =
+        "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+
+    /// The Grok CLI stores its bearer token per auth host, so take the first
+    /// non-empty `key` anywhere in the file rather than assuming one layout.
+    private static func grokCLIToken() throws -> String {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".grok/auth.json")
+        guard
+            let data = try? Data(contentsOf: url),
+            let root = try? JSONSerialization.jsonObject(with: data)
+        else {
+            throw CollectorError.message("Grok CLI not signed in")
+        }
+        func firstKey(_ value: Any) -> String? {
+            if let dictionary = value as? [String: Any] {
+                for (name, child) in dictionary {
+                    if name == "key", let key = child as? String, !key.isEmpty { return key }
+                    if let found = firstKey(child) { return found }
+                }
+            } else if let array = value as? [Any] {
+                for child in array {
+                    if let found = firstKey(child) { return found }
+                }
+            }
+            return nil
+        }
+        guard let token = firstKey(root) else {
+            throw CollectorError.message("Grok CLI not signed in")
+        }
+        return token
     }
 
     private func fetchUsage() async throws -> UsageSnapshot {
