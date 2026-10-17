@@ -731,7 +731,22 @@ final class UsageStore: @unchecked Sendable {
 
 struct CodexAppServerCollector: UsageCollecting {
     let provider: Provider = .codex
-    private let codexPath = "/Applications/Codex.app/Contents/Resources/codex"
+    /// Codex moves its binary between releases — 0.130 relocated it from
+    /// Resources/codex into Resources/codex-cli/bin — so probe the known
+    /// locations instead of pinning one path that a future update breaks.
+    private static let codexPathCandidates = [
+        "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
+        "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        "/Applications/Codex.app/Contents/Resources/codex",
+        "/usr/local/bin/codex",
+        "/opt/homebrew/bin/codex"
+    ]
+
+    private var codexPath: String? {
+        Self.codexPathCandidates.first {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }
+    }
 
     func collect(force _: Bool) async -> UsageSnapshot {
         await Task.detached(priority: .utility) {
@@ -744,8 +759,8 @@ struct CodexAppServerCollector: UsageCollecting {
     }
 
     private func readRateLimits() throws -> UsageSnapshot {
-        guard FileManager.default.isExecutableFile(atPath: codexPath) else {
-            throw CollectorError.message("Codex CLI not found in /Applications/Codex.app")
+        guard let codexPath else {
+            throw CollectorError.message("Codex CLI not found")
         }
 
         let process = Process()
