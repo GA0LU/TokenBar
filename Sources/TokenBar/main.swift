@@ -1910,7 +1910,16 @@ actor CursorUsageCollector: UsageCollecting {
     /// cursor.com/api/usage-summary reports Cursor-side spend only, so this is
     /// the one source that matches the figure on grok.com's usage page.
     private func fetchGrokCredits() async throws -> UsageSnapshot {
-        let token = try Self.grokCLIToken()
+        do {
+            return try await requestGrokCredits(token: try Self.grokCLIToken())
+        } catch CollectorError.grokUnauthorized {
+            // The CLI's access token lasts six hours; renew it and retry once.
+            let refreshed = try await Self.refreshGrokToken()
+            return try await requestGrokCredits(token: refreshed)
+        }
+    }
+
+    private func requestGrokCredits(token: String) async throws -> UsageSnapshot {
 
         var request = URLRequest(url: URL(string: Self.grokCreditsURL)!)
         request.httpMethod = "POST"
@@ -1924,8 +1933,16 @@ actor CursorUsageCollector: UsageCollecting {
         request.httpBody = Data([0, 0, 0, 0, 0])
 
         let (body, response) = try await URLSession.shared.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+        let http = response as? HTTPURLResponse
+        guard http?.statusCode == 200 else {
             throw CollectorError.message("Grok credits API unavailable")
+        }
+        // gRPC-Web answers 200 even when the call failed; the real outcome is in
+        // the grpc-status header, and the body is then empty. Without this check
+        // an expired token looked like an unparseable response and the card
+        // quietly fell back to Cursor's numbers.
+        if let status = http?.value(forHTTPHeaderField: "grpc-status"), status != "0" {
+            throw CollectorError.grokUnauthorized
         }
         guard let config = ProtobufReader.grokCreditsConfig(fromGRPCWeb: body) else {
             throw CollectorError.message("Grok credits response not understood")
@@ -1972,6 +1989,59 @@ actor CursorUsageCollector: UsageCollecting {
             throw CollectorError.message("Grok CLI not signed in")
         }
         return token
+    }
+
+    /// Renew the Grok CLI's access token with its refresh token. The refresh
+    /// token rotates on every use, so the new pair is written straight back to
+    /// auth.json — dropping it would strand the CLI as well as this app.
+    private static func refreshGrokToken() async throws -> String {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".grok/auth.json")
+        guard
+            let data = try? Data(contentsOf: url),
+            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let slot = root.keys.sorted().first,
+            var entry = root[slot] as? [String: Any],
+            let refreshToken = entry["refresh_token"] as? String,
+            let clientID = entry["oidc_client_id"] as? String,
+            let issuer = entry["oidc_issuer"] as? String
+        else {
+            throw CollectorError.grokUnauthorized
+        }
+
+        var request = URLRequest(url: URL(string: issuer + "/oauth2/token")!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        var form = URLComponents()
+        form.queryItems = [
+            URLQueryItem(name: "grant_type", value: "refresh_token"),
+            URLQueryItem(name: "refresh_token", value: refreshToken),
+            URLQueryItem(name: "client_id", value: clientID)
+        ]
+        request.httpBody = form.percentEncodedQuery.map { Data($0.utf8) }
+
+        let (body, response) = try await URLSession.shared.data(for: request)
+        guard
+            (response as? HTTPURLResponse)?.statusCode == 200,
+            let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+            let accessToken = object["access_token"] as? String
+        else {
+            throw CollectorError.grokUnauthorized
+        }
+
+        entry["key"] = accessToken
+        if let rotated = object["refresh_token"] as? String {
+            entry["refresh_token"] = rotated
+        }
+        let lifetime = (object["expires_in"] as? NSNumber)?.doubleValue ?? 3600
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        entry["expires_at"] = formatter.string(from: Date().addingTimeInterval(lifetime))
+        root[slot] = entry
+        if let updated = try? JSONSerialization.data(withJSONObject: root, options: .prettyPrinted) {
+            try? updated.write(to: url, options: .atomic)
+        }
+        return accessToken
     }
 
     private func fetchUsage() async throws -> UsageSnapshot {
@@ -2719,6 +2789,7 @@ struct AntigravityUsageCollector: UsageCollecting {
 }
 
 enum CollectorError: LocalizedError {
+    case grokUnauthorized
     case message(String)
     case unauthorized
     case loginRequired
@@ -2727,6 +2798,7 @@ enum CollectorError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .grokUnauthorized: "Grok sign-in expired — run `grok` to sign in again"
         case .message(let message): message
         case .unauthorized: "Claude token rejected"
         // These point at the menu rather than telling the user to "log in":
